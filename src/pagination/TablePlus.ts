@@ -12,16 +12,17 @@ import { Node } from "@tiptap/pm/model";
 
 export const TablePlus = Table.extend<TablePlusOptions>({
   content: "(tableRowGroup|tableRow)+",
-  addOptions() {
-    return {
-      ...this.parent?.(),
-      resizeHandleStyle: {
-        background: "#353535",
-      },
-      minColumnSize: 50,
-      borderColor: "black",
-    };
-  },
+    addOptions() {
+        const parent = (this.parent?.() as TablePlusOptions) ?? ({} as TablePlusOptions);
+        return {
+            ...parent,
+            resizeHandleStyle: {
+                background: "#353535",
+            },
+            minColumnSize: 50,
+            borderColor: "black",
+        } as TablePlusOptions;
+    },
   addExtensions() {
     return [
       TableRowGroup,
