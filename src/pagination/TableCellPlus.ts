@@ -3,7 +3,10 @@ import TableCell from "@tiptap/extension-table-cell";
 export const TableCellPlus = TableCell.extend({
     addNodeView() {
         return ({ node }) => {
-          const dom = document.createElement('td');
+        const tableNode = this.editor.extensionManager.extensions.find((extension) => extension.name === "table");
+        const borderColor = tableNode ? tableNode.options.borderColor : "black";
+        const dom = document.createElement('td');
+        dom.style.border = `1px solid ${borderColor}`;
           let colspan = node.attrs.colspan;
           let rowspan = node.attrs.rowspan;
           const updateGrid = (colspan: number, rowspan: number) => {
