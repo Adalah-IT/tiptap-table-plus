@@ -241,9 +241,15 @@ export class TablePlusNodeView {
                     }
                 }
             }
-            if (cssRules.trim()) {
+
+            const needsHeightAdjustment = cssRules.trim().length > 0;
+
+            const hadRules = (styleEl.textContent || '').trim().length > 0;
+
+            if (needsHeightAdjustment || hadRules) {
                 styleEl.textContent = cssRules;
             }
+
             requestAnimationFrame(() => {
                 this.renderRowspanOverlays();
             });
