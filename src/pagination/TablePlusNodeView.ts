@@ -23,6 +23,10 @@ export class TablePlusNodeView {
     // observe direction changes
     private dirObserver?: MutationObserver;
 
+    rowspanLayer: HTMLElement;
+    private rafRowspan?: number;
+
+
     constructor(
         node: Node,
         getPos: () => number | undefined,
@@ -51,7 +55,13 @@ export class TablePlusNodeView {
         this.contentDOM.classList.add("table-plus");
         this.contentDOM.style.flex = "1";
         this.dom.appendChild(this.contentDOM);
-
+        this.rowspanLayer = document.createElement("div");
+        this.rowspanLayer.contentEditable = "false";
+        this.rowspanLayer.style.position = "absolute";
+        this.rowspanLayer.style.inset = "0";
+        this.rowspanLayer.style.zIndex = "0";
+        this.rowspanLayer.style.pointerEvents = "none";
+        this.dom.appendChild(this.rowspanLayer);
         // Absolute overlay that spans the table area
         this.slider = document.createElement("div");
         this.slider.contentEditable = "false";
@@ -109,7 +119,79 @@ export class TablePlusNodeView {
     destroy() {
         this.dirObserver?.disconnect();
         this.dirObserver = undefined;
+        if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
     }
+
+    private scheduleRowspanRender() {
+        if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
+        this.rafRowspan = requestAnimationFrame(() => this.renderRowspanOverlays());
+    }
+
+    private renderRowspanOverlays() {
+        this.rowspanLayer.innerHTML = "";
+
+        const wrapperRect = this.dom.getBoundingClientRect();
+
+        const origins = Array.from(
+            this.dom.querySelectorAll<HTMLElement>(
+                'td[data-rm-merge-origin="true"], th[data-rm-merge-origin="true"]'
+            )
+        );
+
+        for (const origin of origins) {
+            const rowspan = Number(origin.getAttribute("data-rm-rowspan") || "1");
+            if (rowspan <= 1) continue; // only needed when vertical merge exists
+
+            const id = origin.getAttribute("data-rm-cell-id");
+            if (!id) continue;
+
+            const members = [
+                origin,
+                ...Array.from(
+                    this.dom.querySelectorAll<HTMLElement>(
+                        `td[data-rm-merged-to="${id}"], th[data-rm-merged-to="${id}"]`
+                    )
+                ),
+            ].filter((el) => getComputedStyle(el).display !== "none");
+
+            if (!members.length) continue;
+
+            // union rect
+            let minL = Infinity, minT = Infinity, maxR = -Infinity, maxB = -Infinity;
+            for (const el of members) {
+                const r = el.getBoundingClientRect();
+                minL = Math.min(minL, r.left);
+                minT = Math.min(minT, r.top);
+                maxR = Math.max(maxR, r.right);
+                maxB = Math.max(maxB, r.bottom);
+            }
+
+            // ✅ surface (fills merged area)
+            const surface = document.createElement("div");
+            surface.className = "rm-merge-surface";
+            surface.style.position = "absolute";
+            surface.style.left = `${minL - wrapperRect.left}px`;
+            surface.style.top = `${minT - wrapperRect.top}px`;
+            surface.style.width = `${maxR - minL}px`;
+            surface.style.height = `${maxB - minT}px`;
+            surface.style.boxSizing = "border-box";
+            surface.style.pointerEvents = "none"; // keep editing on real cells
+
+            // match origin background if any
+            const bg = getComputedStyle(origin).backgroundColor;
+            if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent") {
+                surface.style.backgroundColor = bg;
+            } else {
+                surface.style.backgroundColor = "transparent";
+            }
+
+            // ✅ border around the whole merged area
+            surface.style.border = `1px solid var(--table-border-color, black)`;
+
+            this.rowspanLayer.appendChild(surface);
+        }
+    }
+
 
     // Create full-height line handles and wire drag logic
     addHandles() {
@@ -358,6 +440,8 @@ export class TablePlusNodeView {
         // ensure handles count matches and direction is respected
         this.updateHandles();
         this.updateLockBadge();
+        this.scheduleRowspanRender();
+
     }
 
     getColumnSizes(handles: HTMLElement[]) {
@@ -382,6 +466,8 @@ export class TablePlusNodeView {
             "--cell-percentage",
             _values.map((a) => `${a}%`).join(" ")
         );
+
+        this.scheduleRowspanRender();
 
         if (this.isLocked && updateNode) {
             return;
