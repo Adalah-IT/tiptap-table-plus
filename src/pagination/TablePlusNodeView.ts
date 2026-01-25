@@ -26,7 +26,7 @@ export class TablePlusNodeView {
     rowspanLayer: HTMLElement;
     private rafRowspan?: number;
     private layoutObserver?: ResizeObserver;
-
+    private isAdjustingHeights = false;
     constructor(
         node: Node,
         getPos: () => number | undefined,
@@ -129,6 +129,7 @@ export class TablePlusNodeView {
     }
     private setupLayoutObserver() {
         this.layoutObserver = new ResizeObserver(() => {
+            if (this.isAdjustingHeights) return;
             this.scheduleRowspanRender();
         });
         this.layoutObserver.observe(this.dom);
@@ -142,6 +143,126 @@ export class TablePlusNodeView {
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
     }
 
+    private adjustRowHeightsForMergedCells() {
+        if (this.isAdjustingHeights) return;
+        this.isAdjustingHeights = true;
+
+        try {
+            let styleEl = this.dom.querySelector('style.rm-height-styles') as HTMLStyleElement;
+            if (!styleEl) {
+                styleEl = document.createElement('style');
+                styleEl.className = 'rm-height-styles';
+                this.dom.appendChild(styleEl);
+            }
+
+            const origins = Array.from(
+                this.dom.querySelectorAll<HTMLElement>(
+                    'td[data-rm-merge-origin="true"], th[data-rm-merge-origin="true"]',
+                ),
+            );
+
+            let cssRules = '';
+
+            for (const origin of origins) {
+                const rowspan = Number(origin.getAttribute('data-rm-rowspan') || '1');
+                if (rowspan <= 1) continue;
+
+                const id = origin.getAttribute('data-rm-cell-id');
+                if (!id) continue;
+
+                const content = origin.querySelector<HTMLElement>('.rm-cell-content');
+                if (!content) continue;
+
+                const members = [
+                    origin,
+                    ...Array.from(
+                        this.dom.querySelectorAll<HTMLElement>(
+                            `td[data-rm-merged-to="${id}"], th[data-rm-merged-to="${id}"]`,
+                        ),
+                    ),
+                ];
+
+                const visibleMembers = members.filter((el) => getComputedStyle(el).display !== 'none');
+                if (visibleMembers.length === 0) continue;
+
+                // Get current dimensions
+                let minL = Infinity, maxR = -Infinity, minT = Infinity, maxB = -Infinity;
+                for (const el of visibleMembers) {
+                    const r = el.getBoundingClientRect();
+                    minL = Math.min(minL, r.left);
+                    maxR = Math.max(maxR, r.right);
+                    minT = Math.min(minT, r.top);
+                    maxB = Math.max(maxB, r.bottom);
+                }
+                const currentCombinedHeight = maxB - minT;
+                const mergeWidth = maxR - minL;
+
+
+                const originalPosition = content.style.position;
+                const originalInset = content.style.inset;
+                const originalWidth = content.style.width;
+                const originalHeight = content.style.height;
+                const originalMinHeight = content.style.minHeight;
+
+                content.style.position = 'static';
+                content.style.inset = '';
+                content.style.width = `${mergeWidth}px`;
+                content.style.height = 'auto';
+                content.style.minHeight = 'auto';
+
+                // Force reflow
+                void content.offsetHeight;
+                const contentHeight = content.scrollHeight;
+
+                // Restore original styles
+                content.style.position = originalPosition;
+                content.style.inset = originalInset;
+                content.style.width = originalWidth;
+                content.style.height = originalHeight;
+                content.style.minHeight = originalMinHeight;
+
+                console.log('Height calculation:', {
+                    mergeWidth,
+                    currentCombinedHeight,
+                    contentHeight,
+                    diff: contentHeight - currentCombinedHeight,
+                    needsGrowth: contentHeight > currentCombinedHeight,
+                });
+
+                // Set CSS variables
+                origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
+                origin.style.setProperty('--rm-merge-h', `${Math.max(currentCombinedHeight, contentHeight)}px`);
+                console.log(contentHeight, currentCombinedHeight)
+                const buffer = 45;
+                if (contentHeight + buffer <= currentCombinedHeight) continue;
+                const requiredHeightPerCell = Math.ceil((contentHeight + buffer) / rowspan);
+                for (const member of visibleMembers) {
+                    const cellId = member.getAttribute('data-rm-cell-id');
+                    const mergedTo = member.getAttribute('data-rm-merged-to');
+                    const selector = cellId
+                        ? `[data-rm-cell-id="${cellId}"]`
+                        : mergedTo
+                            ? `[data-rm-merged-to="${mergedTo}"]`
+                            : null;
+
+                    if (selector) {
+                        cssRules += `${selector} { height: ${requiredHeightPerCell}px !important; }\n`;
+                    }
+                }
+            }
+
+            styleEl.textContent = cssRules;
+
+            requestAnimationFrame(() => {
+                this.renderRowspanOverlays();
+            });
+
+        } finally {
+            setTimeout(() => {
+                this.isAdjustingHeights = false;
+            }, 100);
+        }
+    }
     private scheduleRowspanRender() {
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
         this.rafRowspan = requestAnimationFrame(() => {
@@ -150,7 +271,7 @@ export class TablePlusNodeView {
                 setTimeout(() => this.scheduleRowspanRender(), 50);
                 return;
             }
-            this.renderRowspanOverlays();
+            this.adjustRowHeightsForMergedCells();
         });
     }
 
