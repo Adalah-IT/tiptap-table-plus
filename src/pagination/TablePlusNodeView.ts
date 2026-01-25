@@ -82,6 +82,7 @@ export class TablePlusNodeView {
         this.startDirectionObserver();
         this.scheduleInitialRowspanRender();
         this.setupLayoutObserver();
+
     }
 
     private scheduleInitialRowspanRender() {
@@ -220,19 +221,9 @@ export class TablePlusNodeView {
                 content.style.width = originalWidth;
                 content.style.height = originalHeight;
                 content.style.minHeight = originalMinHeight;
-
-                console.log('Height calculation:', {
-                    mergeWidth,
-                    currentCombinedHeight,
-                    contentHeight,
-                    diff: contentHeight - currentCombinedHeight,
-                    needsGrowth: contentHeight > currentCombinedHeight,
-                });
-
                 // Set CSS variables
                 origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
                 origin.style.setProperty('--rm-merge-h', `${Math.max(currentCombinedHeight, contentHeight)}px`);
-                console.log(contentHeight, currentCombinedHeight)
                 const buffer = 45;
                 if (contentHeight + buffer <= currentCombinedHeight) continue;
                 const requiredHeightPerCell = Math.ceil((contentHeight + buffer) / rowspan);
@@ -250,9 +241,9 @@ export class TablePlusNodeView {
                     }
                 }
             }
-
-            styleEl.textContent = cssRules;
-
+            if (cssRules.trim()) {
+                styleEl.textContent = cssRules;
+            }
             requestAnimationFrame(() => {
                 this.renderRowspanOverlays();
             });
@@ -394,14 +385,34 @@ export class TablePlusNodeView {
                 e.preventDefault();
                 document.removeEventListener("pointermove", onPointerMove);
                 document.removeEventListener("pointerup", onPointerUp);
+                this.scheduleRowspanRender();
                 this.updateValues(this.getColumnSizes(this.handles), true);
             };
 
             handle.addEventListener("pointerdown", (e: PointerEvent) => {
-                // Touch devices don’t show cursor; still allow dragging
                 (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
                 e.preventDefault();
                 handleIndex = parseInt(handle.dataset.index ?? "0");
+
+                // ✅ Get handle position
+                const handleRect = handle.getBoundingClientRect();
+                const handleCenterX = handleRect.left + handleRect.width / 2;
+
+                // ✅ Hide only borders that are near the handle
+                this.rowspanLayer.querySelectorAll<HTMLElement>('.rm-merge-surface').forEach(surface => {
+                    const surfaceRect = surface.getBoundingClientRect();
+                    const tolerance = 10; // pixels
+
+                    // Check if handle is near the left edge of surface
+                    if (Math.abs(surfaceRect.left - handleCenterX) < tolerance) {
+                        surface.style.borderLeftColor = 'transparent';
+                    }
+                    // Check if handle is near the right edge of surface
+                    if (Math.abs(surfaceRect.right - handleCenterX) < tolerance) {
+                        surface.style.borderRightColor = 'transparent';
+                    }
+                });
+
                 document.addEventListener("pointermove", onPointerMove);
                 document.addEventListener("pointerup", onPointerUp);
             });
@@ -610,18 +621,18 @@ export class TablePlusNodeView {
     }
 
     updateValues(_values: number[], updateNode: boolean = false) {
+        this.cellPercentage = [..._values];
         this.dom.style.setProperty(
             "--cell-percentage",
             _values.map((a) => `${a}%`).join(" ")
         );
-
-        this.scheduleRowspanRender();
 
         if (this.isLocked && updateNode) {
             return;
         }
 
         if (updateNode) {
+            this.scheduleRowspanRender();
             this.editor.commands.command(({ tr }) => {
                 const pos = this.getPos();
                 if (typeof pos !== "number") return false;
