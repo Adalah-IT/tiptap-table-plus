@@ -25,6 +25,7 @@ export const TableCellPlus = TableCell.extend({
             // ✅ editable area
             const content = document.createElement("div");
             content.className = "rm-cell-content";
+            content.style.paddingInline = '16px'
             dom.appendChild(content);
 
             const apply = (n: any) => {
@@ -36,7 +37,7 @@ export const TableCellPlus = TableCell.extend({
                 dom.style.zIndex = "";
                 dom.style.overflow = "";
                 dom.style.maxHeight = "";
-                dom.style.borderColor = "";
+                dom.style.borderColor = "var(--table-border-color, black)";
                 dom.style.backgroundColor = "";
 
                 content.style.position = "";

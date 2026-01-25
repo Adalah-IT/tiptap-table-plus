@@ -25,7 +25,7 @@ export class TablePlusNodeView {
 
     rowspanLayer: HTMLElement;
     private rafRowspan?: number;
-
+    private layoutObserver?: ResizeObserver;
 
     constructor(
         node: Node,
@@ -80,8 +80,21 @@ export class TablePlusNodeView {
 
         // Start observing direction changes (e.g., switching to Arabic)
         this.startDirectionObserver();
+        this.scheduleInitialRowspanRender();
+        this.setupLayoutObserver();
     }
 
+    private scheduleInitialRowspanRender() {
+        // Use multiple rAF to ensure layout is complete
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                // Additional delay for fonts/styles to load
+                setTimeout(() => {
+                    this.scheduleRowspanRender();
+                }, 100);
+            });
+        });
+    }
     // Observe direction changes on editor root and document
     private startDirectionObserver() {
         const editorEl = this.editor.view.dom as HTMLElement;
@@ -114,17 +127,31 @@ export class TablePlusNodeView {
             attributeFilter: ["dir", "lang"],
         });
     }
+    private setupLayoutObserver() {
+        this.layoutObserver = new ResizeObserver(() => {
+            this.scheduleRowspanRender();
+        });
+        this.layoutObserver.observe(this.dom);
+    }
 
     // Called by ProseMirror when nodeview is removed
     destroy() {
         this.dirObserver?.disconnect();
         this.dirObserver = undefined;
+        this.layoutObserver?.disconnect();
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
     }
 
     private scheduleRowspanRender() {
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
-        this.rafRowspan = requestAnimationFrame(() => this.renderRowspanOverlays());
+        this.rafRowspan = requestAnimationFrame(() => {
+            const rect = this.dom.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) {
+                setTimeout(() => this.scheduleRowspanRender(), 50);
+                return;
+            }
+            this.renderRowspanOverlays();
+        });
     }
 
     private renderRowspanOverlays() {
@@ -185,8 +212,8 @@ export class TablePlusNodeView {
                 surface.style.backgroundColor = "transparent";
             }
 
-            // ✅ border around the whole merged area
-            surface.style.border = `1px solid var(--table-border-color, black)`;
+            const borderColor = getComputedStyle(this.dom).getPropertyValue('--table-border-color').trim() || 'black';
+            surface.style.border = `1px solid ${borderColor}`;
 
             this.rowspanLayer.appendChild(surface);
         }
