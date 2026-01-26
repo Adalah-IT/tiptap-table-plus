@@ -392,8 +392,8 @@ export const TableMergePlus = Extension.create({
                 };
 
         return {
-            mergeTableSelection: mergeInternal(),
-            unmergeTableAtSelection: unmergeInternal(),
+            mergeTableSelection: mergeInternal,
+            unmergeTableAtSelection: unmergeInternal,
             toggleTableMerge:
                 () =>
                     (props: CommandProps) => {

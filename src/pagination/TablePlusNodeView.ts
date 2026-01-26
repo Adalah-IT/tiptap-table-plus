@@ -186,19 +186,16 @@ export class TablePlusNodeView {
                 const visibleMembers = members.filter((el) => getComputedStyle(el).display !== 'none');
                 if (visibleMembers.length === 0) continue;
 
-                // Get current dimensions
-                let minL = Infinity, maxR = -Infinity, minT = Infinity, maxB = -Infinity;
+                // Get merge width from visible members
+                let minL = Infinity, maxR = -Infinity;
                 for (const el of visibleMembers) {
                     const r = el.getBoundingClientRect();
                     minL = Math.min(minL, r.left);
                     maxR = Math.max(maxR, r.right);
-                    minT = Math.min(minT, r.top);
-                    maxB = Math.max(maxB, r.bottom);
                 }
-                const currentCombinedHeight = maxB - minT;
                 const mergeWidth = maxR - minL;
 
-
+                // Measure content height in isolation
                 const originalPosition = content.style.position;
                 const originalInset = content.style.inset;
                 const originalWidth = content.style.width;
@@ -211,22 +208,40 @@ export class TablePlusNodeView {
                 content.style.height = 'auto';
                 content.style.minHeight = 'auto';
 
-                // Force reflow
                 void content.offsetHeight;
                 const contentHeight = content.scrollHeight;
 
-                // Restore original styles
                 content.style.position = originalPosition;
                 content.style.inset = originalInset;
                 content.style.width = originalWidth;
                 content.style.height = originalHeight;
                 content.style.minHeight = originalMinHeight;
-                // Set CSS variables
+
                 origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
-                origin.style.setProperty('--rm-merge-h', `${Math.max(currentCombinedHeight, contentHeight)}px`);
+
+                const pageContentHeight = parseFloat(
+                    getComputedStyle(this.dom).getPropertyValue('--rm-page-content-height') || '0'
+                ) || Infinity;
+
                 const buffer = 45;
-                if (contentHeight + buffer <= currentCombinedHeight) continue;
-                const requiredHeightPerCell = Math.ceil((contentHeight + buffer) / rowspan);
+                const minHeightPerCell = 48;
+                let requiredHeightPerCell = Math.max(
+                    minHeightPerCell,
+                    Math.ceil((contentHeight + buffer) / rowspan)
+                );
+
+                requiredHeightPerCell = Math.min(requiredHeightPerCell, pageContentHeight);
+
+                const lastHeight = origin.dataset.rmLastHeight;
+                const newHeight = requiredHeightPerCell.toString();
+
+                if (lastHeight && Math.abs(parseInt(lastHeight) - requiredHeightPerCell) < 5) {
+                    continue;
+                }
+                origin.dataset.rmLastHeight = newHeight;
+
+                origin.style.setProperty('--rm-merge-h', `${requiredHeightPerCell * rowspan}px`);
+
                 for (const member of visibleMembers) {
                     const cellId = member.getAttribute('data-rm-cell-id');
                     const mergedTo = member.getAttribute('data-rm-merged-to');
@@ -243,7 +258,6 @@ export class TablePlusNodeView {
             }
 
             const needsHeightAdjustment = cssRules.trim().length > 0;
-
             const hadRules = (styleEl.textContent || '').trim().length > 0;
 
             if (needsHeightAdjustment || hadRules) {
@@ -255,9 +269,10 @@ export class TablePlusNodeView {
             });
 
         } finally {
+            // FIX: Longer timeout to let pagination settle
             setTimeout(() => {
                 this.isAdjustingHeights = false;
-            }, 100);
+            }, 250);
         }
     }
     private scheduleRowspanRender() {
