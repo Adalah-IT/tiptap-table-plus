@@ -9,6 +9,7 @@ import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { ReplaceStep } from "prosemirror-transform";
 import { findParentNodeOfType, findParentNodeOfTypeAtPos, calculateNewColumnWidth, addColumns, isNodeAtRange, getColumnSizeList } from "../utilities/utils";
 import { Node } from "@tiptap/pm/model";
+import { TableRowOverflow } from './TableRowOverflow';
 
 export const TablePlus = Table.extend<TablePlusOptions>({
   content: "(tableRow)+",
@@ -312,6 +313,7 @@ export const TablePlus = Table.extend<TablePlusOptions>({
           return isThereUpdate ? tr : null;
         },
       }),
+      TableRowOverflow(),
     ];
   },
 });
