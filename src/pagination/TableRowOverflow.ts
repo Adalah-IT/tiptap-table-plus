@@ -467,7 +467,7 @@ function maybePaginateActiveCell(
     const info = getSelectionTableContext(state);
     if (!info) return false;
 
-    const { cellPos, cellNode, rowPos, rowNode, tableNode } = info;
+    const { cellPos, cellNode, rowPos, rowNode, tableNode, tablePos } = info;
     if (tableNode?.attrs?.locked) return false;
 
     const cellDom = getActiveCellDom(view);
@@ -506,7 +506,11 @@ function maybePaginateActiveCell(
             rmLinkedNext: nextRowId,
         });
 
-        const insertPos = rowPos + rowNode.nodeSize;
+        const spanH = Number(cellNode.attrs?.rmRowspan ?? 1);
+        const insertPos =
+            tablePos != null ? getInsertPosAfterRowspan(tr.doc, tablePos, rowPos, spanH)
+                : (rowPos + rowNode.nodeSize);
+
         tr.insert(insertPos, newRow);
     }
 
@@ -524,8 +528,10 @@ function maybePaginateActiveCell(
 
         tr.deleteRange(cutPos, cellContentTo);
     } else {
-        const cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
+        let cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
+        cutPos = clampInlineCutAwayFromEnd(tr.doc, cutPos);
         const $cut = tr.doc.resolve(cutPos);
+
 
         const textblockDepth = findNearestTextblockDepth($cut);
         if (textblockDepth == null) return false;
@@ -612,6 +618,7 @@ function getTableContextAtPos(
     cellNode: PMNode;
     rowPos: number;
     rowNode: PMNode;
+    tablePos: number
     tableNode: PMNode | null;
 } | null {
     const $pos = state.doc.resolve(pos);
@@ -621,7 +628,7 @@ function getTableContextAtPos(
 
     let rowPos: number | null = null;
     let rowNode: PMNode | null = null;
-
+    let tablePos: number | null = null;
     let tableNode: PMNode | null = null;
 
     for (let d = $pos.depth; d > 0; d--) {
@@ -639,16 +646,17 @@ function getTableContextAtPos(
 
         if (!tableNode && n.type.name === "table") {
             tableNode = n;
+            tablePos = $pos.before(d);
         }
     }
 
-    if (cellPos == null || !cellNode || rowPos == null || !rowNode) return null;
-    return { cellPos, cellNode, rowPos, rowNode, tableNode };
+    if (cellPos == null || !cellNode || rowPos == null || !rowNode || tablePos == null) return null;
+    return { cellPos, cellNode, rowPos, rowNode, tablePos, tableNode };
 }
 
 function paginateCellAtContext(
     view: EditorView,
-    ctx: { cellPos: number; cellNode: PMNode; rowPos: number; rowNode: PMNode; tableNode: PMNode | null },
+    ctx: { cellPos: number; cellNode: PMNode; rowPos: number; rowNode: PMNode; tablePos: number; tableNode: PMNode | null },
     cellDom: HTMLElement,
     onApplyStart: () => void,
     onApplyEnd: () => void,
@@ -691,8 +699,9 @@ function paginateCellAtContext(
             rmLinkedNext: nextRowId,
         });
 
-        tr.insert(rowPos + rowNode.nodeSize, newRow);
-    }
+        const spanH = Number(cellNode.attrs?.rmRowspan ?? 1);
+        const insertPos = getInsertPosAfterRowspan(tr.doc, ctx.tablePos, rowPos, spanH);
+        tr.insert(insertPos, newRow);    }
 
     const cellContentFrom = cellPos + 1;
     const cellContentTo = cellPos + cellNode.nodeSize - 1;
@@ -708,8 +717,10 @@ function paginateCellAtContext(
 
         tr.deleteRange(cutPos, cellContentTo);
     } else {
-        const cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
+        let cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
+        cutPos = clampInlineCutAwayFromEnd(tr.doc, cutPos);
         const $cut = tr.doc.resolve(cutPos);
+
 
         const textblockDepth = findNearestTextblockDepth($cut);
         if (textblockDepth == null) return false;
@@ -860,6 +871,7 @@ function getSelectionTableContext(state: any): {
     cellNode: PMNode;
     rowPos: number;
     rowNode: PMNode;
+    tablePos: number;
     tableNode: PMNode | null;
 } | null {
     const $from = state.selection.$from;
@@ -869,6 +881,7 @@ function getSelectionTableContext(state: any): {
 
     let rowPos: number | null = null;
     let rowNode: PMNode | null = null;
+    let tablePos: number | null = null;
 
     let tableNode: PMNode | null = null;
 
@@ -885,23 +898,132 @@ function getSelectionTableContext(state: any): {
         }
         if (!tableNode && n.type.name === NODE_TABLE) {
             tableNode = n;
+            tablePos = $from.before(d);
         }
     }
 
     if (cellPos == null || !cellNode || rowPos == null || !rowNode) return null;
-    return { cellPos, cellNode, rowPos, rowNode, tableNode };
+    return { cellPos, cellNode, rowPos, rowNode, tablePos, tableNode };
 }
 
-function isOverflowing(el: HTMLElement) {
-    const tdOverflow = el.scrollHeight > el.clientHeight + 1;
 
-    const content = el.querySelector<HTMLElement>(".rm-cell-content");
-    const contentOverflow = content
-        ? content.scrollHeight > content.clientHeight + 1
-        : false;
+function getContentHeightPxFromBlocks(content: HTMLElement): number {
+    const blocks = Array.from(content.children) as HTMLElement[];
+    if (!blocks.length) return 0;
 
-    return tdOverflow || contentOverflow;
+    let top = Number.POSITIVE_INFINITY;
+    let bottom = Number.NEGATIVE_INFINITY;
+
+    for (const b of blocks) {
+        const r = b.getBoundingClientRect();
+        const cs = getComputedStyle(b);
+        const mt = parseFloat(cs.marginTop || "0") || 0;
+        const mb = parseFloat(cs.marginBottom || "0") || 0;
+
+        top = Math.min(top, r.top - mt);
+        bottom = Math.max(bottom, r.bottom + mb);
+    }
+
+    const ccs = getComputedStyle(content);
+    const padTop = parseFloat(ccs.paddingTop || "0") || 0;
+    const padBottom = parseFloat(ccs.paddingBottom || "0") || 0;
+
+    const h = (bottom - top) + padTop + padBottom;
+    return Number.isFinite(h) ? Math.max(0, h) : content.scrollHeight;
 }
+
+
+
+function isOverflowing(td: HTMLElement) {
+    const viewport = getCellViewportEl(td);
+    const content = td.querySelector<HTMLElement>(".rm-cell-content");
+    if (!isMergeOriginDomCell(td) || !content) {
+        const tdOverflow = td.scrollHeight > td.clientHeight + 1;
+        const contentOverflow = content ? content.scrollHeight > content.clientHeight + 1 : false;
+        const viewportOverflow = viewport.scrollHeight > viewport.clientHeight + 1;
+        return tdOverflow || contentOverflow || viewportOverflow;
+    }
+
+    const contentHeightPx = getContentHeightPxFromBlocks(content);
+
+    return contentHeightPx > 800;
+}
+
+
+
+function getSplitBoundaryBottomY(td: HTMLElement): number {
+    const content = td.querySelector<HTMLElement>(".rm-cell-content");
+    if (isMergeOriginDomCell(td) && content) {
+        const r = content.getBoundingClientRect();
+        const cs = getComputedStyle(content);
+        const padBottom = parseFloat(cs.paddingBottom || "0") || 0;
+        return r.top + 921 - padBottom;
+    }
+
+    // normal cells
+    const viewportEl = getCellViewportEl(td);
+    const vr = viewportEl.getBoundingClientRect();
+    const vcs = getComputedStyle(viewportEl);
+    const padBottom = parseFloat(vcs.paddingBottom || "0") || 0;
+    return vr.bottom - padBottom;
+}
+
+function isMergeOriginDomCell(td: HTMLElement): boolean {
+    return td.getAttribute("data-rm-merge-origin") === "true";
+}
+
+function getCellViewportEl(td: HTMLElement): HTMLElement {
+    // merge-origin: viewport الحقيقي هو rm-cell-content (absolute)
+    const content = td.querySelector<HTMLElement>(".rm-cell-content");
+    if (isMergeOriginDomCell(td) && content) return content;
+    return td;
+}
+
+function collectRowPositionsInTable(doc: PMNode, tablePos: number): number[] {
+    const table = doc.nodeAt(tablePos);
+    if (!table || table.type.name !== NODE_TABLE) return [];
+
+    const rows: number[] = [];
+    table.descendants((node, relPos) => {
+        if (node.type.name === NODE_ROW) rows.push(tablePos + 1 + relPos);
+        return true;
+    });
+
+    rows.sort((a, b) => a - b);
+    return rows;
+}
+
+function getInsertPosAfterRowspan(doc: PMNode, tablePos: number, originRowPos: number, spanH: number): number {
+    const rows = collectRowPositionsInTable(doc, tablePos);
+    const originRowNode = doc.nodeAt(originRowPos);
+    if (!originRowNode) return originRowPos;
+
+    const idx = rows.indexOf(originRowPos);
+    if (idx === -1) return originRowPos + originRowNode.nodeSize;
+
+    const safeSpan = Math.max(1, Number(spanH || 1));
+    const lastRowPos = rows[Math.min(idx + safeSpan - 1, rows.length - 1)];
+    const lastRowNode = doc.nodeAt(lastRowPos);
+    if (!lastRowNode) return originRowPos + originRowNode.nodeSize;
+
+    return lastRowPos + lastRowNode.nodeSize;
+}
+
+function clampInlineCutAwayFromEnd(doc: PMNode, cutPos: number): number {
+    const $cut = doc.resolve(cutPos);
+    const d = findNearestTextblockDepth($cut);
+    if (d == null) return cutPos;
+
+    const end = $cut.end(d);
+    const start = $cut.start(d);
+
+    // If tail is too small, move cut earlier
+    if (end - cutPos <= 3) {
+        return Math.max(start + 1, end - 80); // move ~80 positions up (tune)
+    }
+    return cutPos;
+}
+
 function cleanupEmptyLinkedRowInTr(tr: Transaction, currentRowId: string, nextRowId: string) {
     const nextRowPos = findRowPosById(tr.doc, nextRowId);
     if (nextRowPos == null) return;
@@ -1142,20 +1264,6 @@ function getCellChildRange(cellPos: number, cellNode: PMNode, childIndex: number
     return { from, to };
 }
 
-function findLastTextblockInCell(doc: PMNode, cellPos: number): { pos: number; node: PMNode } | null {
-    const cell = doc.nodeAt(cellPos);
-    if (!cell) return null;
-
-    const base = cellPos + 1;
-    let last: { pos: number; node: PMNode } | null = null;
-
-    cell.descendants((node, relPos) => {
-        if (node.isTextblock) last = { pos: base + relPos, node };
-        return true;
-    });
-
-    return last;
-}
 
 function findFirstTextPosInsideCell(doc: PMNode, cellPos: number) {
     const cell = doc.nodeAt(cellPos);
@@ -1219,10 +1327,17 @@ function computeSplitPoint(
     const content = cellDom.querySelector(".rm-cell-content") as HTMLElement | null;
     if (!content) return null;
 
-    const cellRect = cellDom.getBoundingClientRect();
-    const cs = getComputedStyle(cellDom);
+    const viewportEl = getCellViewportEl(cellDom);
+    const viewportRect = viewportEl.getBoundingClientRect();
+    const cs = getComputedStyle(viewportEl);
     const padBottom = parseFloat(cs.paddingBottom || "0");
-    const innerBottom = cellRect.bottom - padBottom;
+
+    let innerBottom: number;
+    if (isMergeOriginDomCell(cellDom)) {
+        innerBottom = viewportRect.top + 921 - padBottom; // todo check it issue rowspan
+    } else {
+        innerBottom = viewportRect.bottom - padBottom;
+    }
 
     const blocks = Array.from(content.children) as HTMLElement[];
     let lastFullyVisible = -1;
@@ -1240,7 +1355,7 @@ function computeSplitPoint(
     }
 
     const isRTL = getComputedStyle(view.dom).direction === "rtl";
-    const x = isRTL ? cellRect.right - 6 : cellRect.left + 6;
+    const x = isRTL ? viewportRect.right - 6 : viewportRect.left + 6;
     const y = innerBottom - 2;
 
     const inViewport = y >= 0 && y <= window.innerHeight;
