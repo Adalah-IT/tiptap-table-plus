@@ -57,7 +57,6 @@ export function TableRowOverflow() {
             const run = () => {
                 if (typeof window === "undefined" || typeof document === "undefined") return;
                 if (applying) return;
-                if ((view as any).composing) return;
 
                 const didPaginateActive = maybePaginateActiveCell(view, onStart, onEnd, {
                     moveSelection: view.hasFocus() && view.state.selection.empty,

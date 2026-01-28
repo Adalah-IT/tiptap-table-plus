@@ -219,10 +219,6 @@ export class TablePlusNodeView {
 
                 origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
 
-                const pageContentHeight = parseFloat(
-                    getComputedStyle(this.dom).getPropertyValue('--rm-page-content-height') || '0'
-                ) || Infinity;
-
                 const buffer = 45;
                 const minHeightPerCell = 48;
                 let requiredHeightPerCell = Math.max(
@@ -230,7 +226,7 @@ export class TablePlusNodeView {
                     Math.ceil((contentHeight + buffer) / rowspan)
                 );
 
-                requiredHeightPerCell = Math.min(requiredHeightPerCell, pageContentHeight);
+                requiredHeightPerCell = Math.min(requiredHeightPerCell, 440);
 
                 const lastHeight = origin.dataset.rmLastHeight;
                 const newHeight = requiredHeightPerCell.toString();
