@@ -543,7 +543,7 @@ function maybePaginateActiveCell(
         if (!tail.content.size) return false;
 
         const tbType = $cut.node(textblockDepth).type;
-        const movedBlock = tbType.create(tbType.defaultAttrs, tail.content);
+        const movedBlock = tbType.create(null, tail.content);
 
         movedSlice = new Slice(Fragment.from(movedBlock), 0, 0);
 
@@ -732,7 +732,7 @@ function paginateCellAtContext(
         if (!tail.content.size) return false;
 
         const tbType = $cut.node(textblockDepth).type;
-        const movedBlock = tbType.create(tbType.defaultAttrs, tail.content);
+        const movedBlock = tbType.create(null, tail.content);
         movedSlice = new Slice(Fragment.from(movedBlock), 0, 0);
 
         tr.deleteRange(cutPos, tbEnd);
@@ -902,7 +902,7 @@ function getSelectionTableContext(state: any): {
         }
     }
 
-    if (cellPos == null || !cellNode || rowPos == null || !rowNode) return null;
+    if (cellPos == null || !cellNode || rowPos == null || !rowNode || tablePos == null) return null;
     return { cellPos, cellNode, rowPos, rowNode, tablePos, tableNode };
 }
 
