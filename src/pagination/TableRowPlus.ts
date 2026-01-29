@@ -4,9 +4,6 @@ export const TableRowPlus = TableRow.extend({
     addAttributes() {
         return {
             ...this.parent?.(),
-            rmRowId: { default: null as string | null },
-            rmLinkedPrev: { default: null as string | null },
-            rmLinkedNext: { default: null as string | null },
 
             textAlign: {
                 default: null,
@@ -17,11 +14,20 @@ export const TableRowPlus = TableRow.extend({
                     null,
                 renderHTML: (attrs) => {
                     if (!attrs.textAlign) return {};
-                    return {
-                        style: `text-align:${attrs.textAlign}`,
-                        "data-align": attrs.textAlign,
-                    };
+                    return { style: `text-align:${attrs.textAlign}`, "data-align": attrs.textAlign };
                 },
+            },
+
+            rmRowId: {
+                default: null,
+                parseHTML: (el) => el.getAttribute("data-rm-row-id") || null,
+                renderHTML: (attrs) => (attrs.rmRowId ? { "data-rm-row-id": attrs.rmRowId } : {}),
+            },
+
+            rmLinkedTo: {
+                default: null,
+                parseHTML: (el) => el.getAttribute("data-rm-linked-to") || null,
+                renderHTML: (attrs) => (attrs.rmLinkedTo ? { "data-rm-linked-to": attrs.rmLinkedTo } : {}),
             },
         };
     },
@@ -34,7 +40,6 @@ export const TableRowPlus = TableRow.extend({
             dom.style.position = "relative";
 
             const apply = (n: typeof node) => {
-                // align
                 const align = n.attrs.textAlign;
                 if (align) {
                     dom.style.textAlign = align;
@@ -44,14 +49,11 @@ export const TableRowPlus = TableRow.extend({
                     delete dom.dataset.align;
                 }
 
-                if (n.attrs.rmRowId) dom.dataset.rmRowId = String(n.attrs.rmRowId);
+                if (n.attrs.rmRowId) dom.dataset.rmRowId = n.attrs.rmRowId;
                 else delete dom.dataset.rmRowId;
 
-                if (n.attrs.rmLinkedPrev) dom.dataset.rmLinkedPrev = String(n.attrs.rmLinkedPrev);
-                else delete dom.dataset.rmLinkedPrev;
-
-                if (n.attrs.rmLinkedNext) dom.dataset.rmLinkedNext = String(n.attrs.rmLinkedNext);
-                else delete dom.dataset.rmLinkedNext;
+                if (n.attrs.rmLinkedTo) dom.dataset.rmLinkedTo = n.attrs.rmLinkedTo;
+                else delete dom.dataset.rmLinkedTo;
             };
 
             apply(node);

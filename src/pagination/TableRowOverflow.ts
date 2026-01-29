@@ -1,912 +1,354 @@
-import {
-    Plugin,
-    PluginKey,
-    TextSelection,
-    type EditorState,
-    type Transaction,
-} from "@tiptap/pm/state";
+import { Plugin, PluginKey, TextSelection, type EditorState } from "@tiptap/pm/state";
 import type { EditorView } from "@tiptap/pm/view";
-import type { Node as PMNode } from "@tiptap/pm/model";
-import { Slice, Fragment } from "@tiptap/pm/model";
-
-export const tableRowOverflowPluginKey = new PluginKey("rmTableRowOverflow");
-
-const RM_ROW_CLEANUP_META = "rmRowCleanup";
-
-const NODE_TABLE = "table";
-const NODE_ROW = "tableRow";
-const NODE_GROUP = "tableRowGroup";
-const NODE_CELL = "tableCell";
-const NODE_HEADER = "tableHeader";
-
-// Step 4 tuning
-const MERGE_BACK_MIN_FREE_PX = 18; // must have at least this much free room
-const MERGE_BACK_BUFFER_PX = 10;   // safety buffer (borders/padding/rounding)
-
-/**
- * - paginate overflowing active cell (insert linked row, move overflow, cursor)
- * - cleanup linked rows when user deletes origin row (or any row in chain)
- * - merge-back when space becomes available after deletion (pull content up + delete empty linked rows)
- */
-export function TableRowOverflow() {
-    let applying = false;
-    let raf: number | null = null;
-
-    return new Plugin({
-        key: tableRowOverflowPluginKey,
-
-        appendTransaction(transactions, oldState, newState) {
-            if (transactions.some((t) => t.getMeta(RM_ROW_CLEANUP_META))) return null;
-            if (!transactions.some((t) => t.docChanged)) return null;
-            return cleanupDeletedRowChains(oldState, newState);
-        },
-
-        view(view) {
-            const schedule = (fn: () => void) => {
-                if (raf) cancelAnimationFrame(raf);
-                raf = requestAnimationFrame(fn);
-            };
-
-            const onStart = () => (applying = true);
-
-            const onEnd = () => {
-                applying = false;
-                schedule(run);
-            };
-
-            const run = () => {
-                if (typeof window === "undefined" || typeof document === "undefined") return;
-                if (applying) return;
-
-                const didPaginateActive = maybePaginateActiveCell(view, onStart, onEnd, {
-                    moveSelection: view.hasFocus() && view.state.selection.empty,
-                });
-                if (didPaginateActive) return;
-
-                const didReflow = maybePaginateFirstOverflowInCurrentTable(view, onStart, onEnd);
-                if (didReflow) return;
-
-                const didGlobalReflow = maybePaginateFirstOverflowInEditor(view, onStart, onEnd);
-                if (didGlobalReflow) return;
-
-                void maybeMergeBackActiveCell(view, onStart, onEnd);
-            };
-
-            return {
-                update(view: EditorView, prevState) {
-                    const docChanged = view.state.doc !== prevState.doc;
-                    const selChanged = !view.state.selection.eq(prevState.selection);
-                    if (!docChanged && !selChanged) return;
-
-                    schedule(run);
-                },
-                destroy() { if (raf) cancelAnimationFrame(raf); }
-            };
-        }
-
-    });
-}
-
-
-async function maybeMergeBackActiveCell(
-    view: EditorView,
-    onApplyStart: () => void,
-    onApplyEnd: () => void,
-): Promise<boolean> {
-    const state = view.state;
-    const info = getSelectionTableContext(state);
-    if (!info) return false;
-
-    const { rowPos, rowNode, cellPos, tableNode } = info;
-    if (tableNode?.attrs?.locked) return false;
-
-    const currentRowId = asStringOrNull(rowNode.attrs?.rmRowId);
-    const nextRowId = asStringOrNull(rowNode.attrs?.rmLinkedNext);
-    if (!currentRowId || !nextRowId) return false;
-
-    const cellIndex = getCellIndexInRow(rowNode, rowPos, cellPos);
-    if (cellIndex < 0) return false;
-
-    const originTd = getActiveCellDom(view);
-    if (!originTd) return false;
-
-    // Must NOT be overflowing
-    if (isOverflowing(originTd)) return false;
-
-    //  Correct capacity: how much more can fit BEFORE max-height
-    const capacityPx = getCellAvailableCapacityPx(originTd);
-    if (capacityPx < MERGE_BACK_MIN_FREE_PX) return false;
-
-    const nextRowPos = findRowPosById(state.doc, nextRowId);
-    if (nextRowPos == null) return false;
-
-    const nextRowNode = state.doc.nodeAt(nextRowPos);
-    if (!nextRowNode || nextRowNode.type.name !== NODE_ROW) return false;
-
-    const nextPrev = asStringOrNull(nextRowNode.attrs?.rmLinkedPrev);
-    if (nextPrev && nextPrev !== currentRowId) return false;
-
-    const nextCellPos = getCellPosInRow(state.doc, nextRowPos, cellIndex);
-    if (nextCellPos == null) return false;
-
-    const nextCellNode = state.doc.nodeAt(nextCellPos);
-    if (!nextCellNode) return false;
-
-    // If next row is already empty -> delete/relink it
-    if (isRowCompletelyEmpty(nextRowNode)) {
-        return deleteRowIfEmptyAndRelink(view, currentRowId, rowPos, nextRowPos, nextRowId);
-    }
-
-    // Need DOM of next cell to estimate first block height
-    const nextTd = getCellDomByPos(view, nextCellPos);
-    if (!nextTd) return false;
-
-    const nextContent = nextTd.querySelector(".rm-cell-content") as HTMLElement | null;
-    if (!nextContent) return false;
-
-    const firstBlockIndex = getFirstMeaningfulBlockIndex(nextCellNode);
-    if (firstBlockIndex == null) return false;
-
-    const firstBlockEl = (nextContent.children[firstBlockIndex] as HTMLElement | undefined) ?? null;
-    if (!firstBlockEl) return false;
-
-    const blockH = firstBlockEl.getBoundingClientRect().height;
-    if (blockH + MERGE_BACK_BUFFER_PX > capacityPx) {
-        // Step 4a: we only move whole blocks. (Partial move comes later.)
-        return false;
-    }
-
-    const tr = state.tr;
-    tr.setMeta(RM_ROW_CLEANUP_META, true);
-
-    const oldSelection = state.selection;
-
-    // Move the block (PM transaction)
-    const moved = moveWholeBlockFromNextToOrigin(tr, {
-        originCellPos: cellPos,
-        nextCellPos,
-        nextBlockIndex: firstBlockIndex,
-    });
-
-    if (!moved) return false;
-
-    // If next row becomes empty after move, delete it + relink chain
-    cleanupEmptyLinkedRowInTr(tr, currentRowId, nextRowId);
-
-    // Keep cursor stable
-    const mappedSel = oldSelection.map(tr.doc, tr.mapping);
-    tr.setSelection(mappedSel);
-
-    onApplyStart();
-    try {
-        view.dispatch(tr);
-        return true;
-    } finally {
-        requestAnimationFrame(() => onApplyEnd());
-    }
-}
-
-
-function moveWholeBlockFromNextToOrigin(
-    tr: Transaction,
-    args: {
-        originCellPos: number;
-        nextCellPos: number;
-        nextBlockIndex: number;
-    },
-): boolean {
-    const { originCellPos, nextCellPos, nextBlockIndex } = args;
-
-    const nextCellNode = tr.doc.nodeAt(nextCellPos);
-    if (!nextCellNode) return false;
-
-    const nextRange = getCellChildRange(nextCellPos, nextCellNode, nextBlockIndex);
-    if (!nextRange) return false;
-
-    const movedSlice = tr.doc.slice(nextRange.from, nextRange.to);
-    if (!movedSlice.content.size) return false;
-
-    // 1) delete from next cell
-    tr.deleteRange(nextRange.from, nextRange.to);
-
-    // 2) insert into origin cell
-    const originCellNode = tr.doc.nodeAt(originCellPos);
-    if (!originCellNode) return false;
-
-    const originFrom = originCellPos + 1;
-    const originTo = originCellPos + originCellNode.nodeSize - 1;
-    const closed = new Slice(movedSlice.content, 0, 0);
-
-    if (isEmptyPlaceholderCell(originCellNode)) {
-        // replace placeholder
-        tr.replaceRange(originFrom, originTo, closed);
-    } else {
-        // append to end of cell content
-        tr.replaceRange(originTo, originTo, closed);
-    }
-
-    return true;
-}
-
-
-function deleteRowIfEmptyAndRelink(
-    view: EditorView,
-    currentRowId: string,
-    currentRowPos: number,
-    nextRowPos: number,
-    nextRowId: string,
-): boolean {
-    const state = view.state;
-    const tr = state.tr;
-    tr.setMeta(RM_ROW_CLEANUP_META, true);
-
-    const nextRowNode = state.doc.nodeAt(nextRowPos);
-    if (!nextRowNode || nextRowNode.type.name !== NODE_ROW) return false;
-
-    // ensure it's truly empty row (all cells empty)
-    if (!isRowCompletelyEmpty(nextRowNode)) return false;
-
-    const nextNextId = asStringOrNull(nextRowNode.attrs?.rmLinkedNext);
-
-    // delete next row
-    tr.deleteRange(nextRowPos, nextRowPos + nextRowNode.nodeSize);
-
-    // relink current row -> nextNext
-    safeSetNodeMarkup(tr, currentRowPos, NODE_ROW, (attrs) => ({
-        ...attrs,
-        rmLinkedNext: nextNextId ?? null,
-    }));
-
-    // update nextNext.rmLinkedPrev -> currentRowId
-    if (nextNextId) {
-        const nextNextPos = findRowPosById(tr.doc, nextNextId);
-        if (nextNextPos != null) {
-            safeSetNodeMarkup(tr, nextNextPos, NODE_ROW, (attrs) => ({
-                ...attrs,
-                rmLinkedPrev: currentRowId,
-            }));
-        }
-    }
-
-    if (!tr.steps.length) return false;
-
-    view.dispatch(tr);
-    return true;
-}
-
-
-function cleanupDeletedRowChains(oldState: EditorState, newState: EditorState): Transaction | null {
-    const oldRows = collectRowsById(oldState.doc);
-    if (oldRows.size === 0) return null;
-
-    const newRows = collectRowsById(newState.doc);
-    const deletedIds: string[] = [];
-
-    for (const id of oldRows.keys()) {
-        if (!newRows.has(id)) deletedIds.push(id);
-    }
-    if (deletedIds.length === 0) return null;
-
-    const removeIds = new Set<string>();
-    const clearPrevIds = new Set<string>();
-
-    for (const deletedId of deletedIds) {
-        const oldRow = oldRows.get(deletedId);
-        if (!oldRow) continue;
-
-        const prevId = asStringOrNull(oldRow.node.attrs?.rmLinkedPrev);
-        if (prevId && newRows.has(prevId)) {
-            clearPrevIds.add(prevId);
-        }
-
-        let nextId = asStringOrNull(oldRow.node.attrs?.rmLinkedNext);
-        while (nextId) {
-            if (removeIds.has(nextId)) break;
-            removeIds.add(nextId);
-
-            const nextOld = oldRows.get(nextId);
-            if (!nextOld) break;
-            nextId = asStringOrNull(nextOld.node.attrs?.rmLinkedNext);
-        }
-    }
-
-    if (removeIds.size === 0 && clearPrevIds.size === 0) return null;
-
-    const structure = collectRowStructure(newState.doc, removeIds);
-
-    const tr = newState.tr;
-    tr.setMeta(RM_ROW_CLEANUP_META, true);
-
-    for (const prevId of clearPrevIds) {
-        const row = structure.rowsById.get(prevId);
-        if (!row) continue;
-        if (structure.tablesToDelete.has(row.tablePos)) continue;
-        if (row.groupPos != null && structure.groupsToDelete.has(row.groupPos)) continue;
-
-        safeSetNodeMarkup(tr, row.pos, NODE_ROW, (attrs) => ({
-            ...attrs,
-            rmLinkedNext: null,
-        }));
-    }
-
-    const deletions: Array<{ pos: number; size: number }> = [];
-
-    for (const tablePos of structure.tablesToDelete) {
-        const node = newState.doc.nodeAt(tablePos);
-        if (!node || node.type.name !== NODE_TABLE) continue;
-        deletions.push({ pos: tablePos, size: node.nodeSize });
-    }
-
-    for (const groupPos of structure.groupsToDelete) {
-        const parentTablePos = structure.groupToTablePos.get(groupPos);
-        if (parentTablePos != null && structure.tablesToDelete.has(parentTablePos)) continue;
-
-        const node = newState.doc.nodeAt(groupPos);
-        if (!node || node.type.name !== NODE_GROUP) continue;
-        deletions.push({ pos: groupPos, size: node.nodeSize });
-    }
-
-    for (const row of structure.rowsToDelete) {
-        if (structure.tablesToDelete.has(row.tablePos)) continue;
-        if (row.groupPos != null && structure.groupsToDelete.has(row.groupPos)) continue;
-
-        const node = newState.doc.nodeAt(row.pos);
-        if (!node || node.type.name !== NODE_ROW) continue;
-        deletions.push({ pos: row.pos, size: node.nodeSize });
-    }
-
-    if (deletions.length === 0 && tr.steps.length === 0) return null;
-
-    deletions.sort((a, b) => b.pos - a.pos);
-    for (const d of deletions) {
-        tr.deleteRange(d.pos, d.pos + d.size);
-    }
-
-    return tr.steps.length ? tr : null;
-}
-
-function collectRowsById(doc: PMNode): Map<string, { node: PMNode; pos: number }> {
-    const map = new Map<string, { node: PMNode; pos: number }>();
-    doc.descendants((node, pos) => {
-        if (node.type.name !== NODE_ROW) return true;
-        const id = asStringOrNull(node.attrs?.rmRowId);
-        if (!id) return true;
-        map.set(id, { node, pos });
-        return true;
-    });
-    return map;
-}
-
-type RowInfo = {
-    id: string;
-    pos: number;
-    tablePos: number;
-    groupPos: number | null;
+import type { Node as PMNode } from 'prosemirror-model';
+
+export const TableRowOverflowKey = new PluginKey("TableRowOverflow");
+const RM_CLEANUP_META = "rmRowOverflowCleanup";
+
+const LIMIT = 880;
+const PULL_GAP = 24;
+const PULL_MARGIN = 12;
+
+const uuid = () => {
+    const c: any = globalThis.crypto;
+    if (c?.randomUUID) return c.randomUUID();
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
-function collectRowStructure(doc: PMNode, removeIds: Set<string>) {
-    const rowsById = new Map<string, RowInfo>();
-    const rowsToDelete: RowInfo[] = [];
+const isCellType = (t: any) =>
+    t?.spec?.tableRole === "cell" ||
+    t?.spec?.tableRole === "header_cell" ||
+    t?.name === "tableCell" ||
+    t?.name === "tableHeader" ||
+    t?.name === "table_cell" ||
+    t?.name === "table_header";
 
-    const tableKeepCounts = new Map<number, number>();
-    const groupKeepCounts = new Map<number, number>();
-    const groupToTablePos = new Map<number, number>();
+const findCell = (state: EditorState) => {
+    const { $from } = state.selection;
+    for (let d = $from.depth; d > 0; d--) {
+        const n = $from.node(d);
+        if (isCellType(n.type)) return { node: n, pos: $from.before(d), depth: d };
+    }
+    return null;
+};
 
-    doc.descendants((node, pos) => {
-        if (node.type.name !== NODE_ROW) return true;
+const findRow = (state: EditorState) => {
+    const { $from } = state.selection as any;
+    for (let d = $from.depth; d > 0; d--) {
+        const n = $from.node(d);
+        if (n.type?.name === "tableRow" || n.type?.name === "table_row") return { node: n, pos: $from.before(d), depth: d };
+    }
+    return null;
+};
 
-        const resolved = doc.resolve(pos + 1);
-        const table = findAncestor(resolved, NODE_TABLE);
-        if (!table) return true;
+const inCell = (state: EditorState) => !!findCell(state);
 
-        const group = findAncestor(resolved, NODE_GROUP);
+const currentCellEl = (view: EditorView) => {
+    const { from } = view.state.selection;
+    const at = view.domAtPos(from);
+    const el = at.node instanceof HTMLElement ? at.node : at.node.parentElement;
+    return (el?.closest?.("td,th") as HTMLElement | null) ?? null;
+};
 
-        const id = asStringOrNull(node.attrs?.rmRowId);
-        const rowWillBeDeleted = id ? removeIds.has(id) : false;
-        const rowCountsAsKeep = id ? !rowWillBeDeleted : true;
+const isNormalCell = (cellNode: any) =>
+    !cellNode?.attrs?.rmMergedTo &&
+    !(cellNode?.attrs?.rmMergeOrigin && Number(cellNode?.attrs?.rmRowspan || 1) > 1);
 
-        if (rowCountsAsKeep) {
-            tableKeepCounts.set(table.pos, (tableKeepCounts.get(table.pos) ?? 0) + 1);
-            if (group) {
-                groupKeepCounts.set(group.pos, (groupKeepCounts.get(group.pos) ?? 0) + 1);
-                groupToTablePos.set(group.pos, table.pos);
-            }
-        } else {
-            if (group) groupToTablePos.set(group.pos, table.pos);
-        }
+const createEmptyCell = (templateCellNode: any, schema: any) => {
+    const cellType = templateCellNode.type;
+    const attrs = {
+        ...(templateCellNode.attrs ?? {}),
+        rmMergedTo: null,
+        rmMergeOrigin: false,
+        rmHideMode: null,
+        rmRowspan: 1,
+        rmCellId: null,
+    };
+    const filled = cellType.createAndFill?.(attrs);
+    if (filled) return filled;
 
-        if (id) {
-            const info: RowInfo = { id, pos, tablePos: table.pos, groupPos: group?.pos ?? null };
-            rowsById.set(id, info);
-            if (removeIds.has(id)) rowsToDelete.push(info);
-        }
+    const p = schema.nodes.paragraph?.createAndFill?.();
+    return cellType.create(attrs, p ? [p] : undefined);
+};
+const isRowNode = (n: any) => !!n && (n.type?.name === "tableRow" || n.type?.name === "table_row");
 
-        return true;
+const colIndexInDomRow = (view: EditorView) => {
+    const cell = currentCellEl(view);
+    if (!cell) return null;
+
+    const tr = cell.closest("tr");
+    if (!tr) return null;
+
+    const cells = Array.from(tr.children).filter((n) => {
+        const tag = (n as HTMLElement).tagName;
+        return tag === "TD" || tag === "TH";
     });
 
-    const tablesToDelete = new Set<number>();
-    doc.descendants((node, pos) => {
-        if (node.type.name !== NODE_TABLE) return true;
-        const keep = tableKeepCounts.get(pos) ?? 0;
-        if (keep === 0) tablesToDelete.add(pos);
-        return true;
-    });
+    const idx = cells.indexOf(cell);
+    return idx >= 0 ? idx : null;
+};
 
-    const groupsToDelete = new Set<number>();
-    doc.descendants((node, pos) => {
-        if (node.type.name !== NODE_GROUP) return true;
-        const keep = groupKeepCounts.get(pos) ?? 0;
-        if (keep === 0) groupsToDelete.add(pos);
-        return true;
-    });
+const selectSameColInRow = (doc: any, rowPos: number, colIndex: number) => {
+    const rowNode = doc.nodeAt(rowPos);
+    if (!rowNode) return null;
 
-    return { rowsById, rowsToDelete, tablesToDelete, groupsToDelete, groupToTablePos };
-}
+    const target = Math.max(0, Math.min(colIndex, rowNode.childCount - 1));
 
-function findAncestor($pos: any, typeName: string): { pos: number; node: PMNode } | null {
-    for (let d = $pos.depth; d > 0; d--) {
-        const n = $pos.node(d);
-        if (n.type.name === typeName) {
-            return { pos: $pos.before(d), node: n };
+    let pos = rowPos + 1;
+    for (let i = 0; i < target; i++) pos += rowNode.child(i).nodeSize;
+
+    return TextSelection.near(doc.resolve(pos + 1));
+};
+
+const buildGotoOrInsertTr = (view: EditorView) => {
+    const { state } = view;
+
+    const cell = findCell(state);
+    const row = findRow(state);
+    const table = findTable(state);
+    if (!cell || !row || !table) return null;
+
+    const colIndex = colIndexInDomRow(view) ?? state.selection.$from.index(row.depth);
+
+    const rowId = row.node.attrs?.rmRowId as string | null;
+    const linkedTo = row.node.attrs?.rmLinkedTo as string | null;
+
+    const mainRowId = linkedTo || rowId || uuid();
+
+    let tr = state.tr;
+    const spanH = Number(cell.node.attrs?.rmRowspan ?? 1);
+
+    const insertPos = !isNormalCell(cell.node) ? getInsertPosAfterRowspan(tr.doc, table.pos, row.pos, spanH)
+                                                : (row.pos + row.node.nodeSize);
+
+    const nextRow = state.doc.nodeAt(insertPos);
+
+    if (isRowNode(nextRow) && nextRow.attrs?.rmLinkedTo === mainRowId) {
+        const sel = selectSameColInRow(state.doc, insertPos, colIndex);
+        if (!sel) return null;
+        return state.tr.setSelection(sel);
+    }
+
+    const cells = [];
+    for (let i = 0; i < row.node.childCount; i++) {
+        cells.push(createEmptyCell(row.node.child(i), state.schema));
+    }
+
+    const newRow = row.node.type.create(
+        { ...row.node.attrs, rmRowId: null,   rmLinkedTo: mainRowId },
+        cells,
+    );
+
+    if (!linkedTo && !rowId) {
+        tr = tr.setNodeMarkup(row.pos, undefined, { ...row.node.attrs, rmRowId: mainRowId });
+    }
+
+    tr = tr.insert(insertPos, newRow);
+
+    const sel = selectSameColInRow(tr.doc, insertPos, colIndex);
+    if (sel) tr = tr.setSelection(sel);
+
+    return tr;
+};
+
+const insertOrGotoLinkedRow = (view: EditorView) => {
+    const tr = buildGotoOrInsertTr(view);
+    if (!tr) return false;
+    view.dispatch(tr);
+    view.focus();
+    return true;
+};
+
+const measureTextHeight = (contentEl: HTMLElement, text: string) => {
+    const m = document.createElement("p");
+    m.style.position = "fixed";
+    m.style.left = "-99999px";
+    m.style.top = "0";
+    m.style.visibility = "hidden";
+    m.style.margin = "0";
+    m.style.whiteSpace = "pre-wrap";
+    m.style.wordBreak = "break-word";
+    const cs = window.getComputedStyle(contentEl);
+    m.style.width = `${contentEl.clientWidth}px`;
+    m.style.font = cs.font;
+    m.style.fontSize = cs.fontSize;
+    m.style.lineHeight = cs.lineHeight;
+    m.style.letterSpacing = cs.letterSpacing;
+    m.textContent = text;
+    document.body.appendChild(m);
+    const h = m.scrollHeight;
+    m.remove();
+    return h;
+};
+
+const isEmptyParagraph = (n: any) =>
+    n?.type?.name === "paragraph" && n.content.size === 0;
+
+const getMainRowId = (rowNode: any) =>
+    (rowNode?.attrs?.rmLinkedTo as string | null) ||
+    (rowNode?.attrs?.rmRowId as string | null) ||
+    null;
+
+const getNextLinkedRow = (state: EditorState, rowPos: number, rowNode: any, mainRowId: string) => {
+    const table = findTable(state);
+    const cell = findCell(state);
+    if (!table || !cell) return null;
+
+    const spanH = Number(cell.node.attrs?.rmRowspan ?? 1);
+    const nextPos = !isNormalCell(cell.node)
+        ? getInsertPosAfterRowspan(state.doc as any, table.pos, rowPos, spanH)
+        : (rowPos + rowNode.nodeSize);
+
+    const nextRow = state.doc.nodeAt(nextPos);
+    if (isRowNode(nextRow) && nextRow.attrs?.rmLinkedTo === mainRowId) {
+        return { pos: nextPos, node: nextRow };
+    }
+    return null;
+};
+
+const getCellAtRowPos = (doc: any, rowPos: number, colIndex: number) => {
+    const rowNode = doc.nodeAt(rowPos);
+    if (!rowNode) return null;
+
+    const target = Math.max(0, Math.min(colIndex, rowNode.childCount - 1));
+
+    let pos = rowPos + 1;
+    for (let i = 0; i < target; i++) pos += rowNode.child(i).nodeSize;
+
+    const cellNode = doc.nodeAt(pos);
+    if (!cellNode) return null;
+
+    return { pos, node: cellNode };
+};
+
+const firstNonEmptyBlock = (cellNode: any) => {
+    for (let i = 0; i < cellNode.childCount; i++) {
+        const ch = cellNode.child(i);
+        if (!(ch.type?.name === "paragraph" && ch.content.size === 0)) {
+            return { node: ch, index: i };
         }
     }
     return null;
-}
+};
 
+const cellInsertPosAtEnd = (cellPos: number, cellNode: any) => {
+    let insertPos = cellPos + cellNode.nodeSize - 1;
 
-function maybePaginateActiveCell(
-    view: EditorView,
-    onApplyStart: () => void,
-    onApplyEnd: () => void,
-    opts?: { moveSelection?: boolean },
-): boolean {
-    const state = view.state;
-    const { schema } = state;
-
-    const info = getSelectionTableContext(state);
-    if (!info) return false;
-
-    const { cellPos, cellNode, rowPos, rowNode, tableNode, tablePos } = info;
-    if (tableNode?.attrs?.locked) return false;
-
-    const cellDom = getActiveCellDom(view);
-    if (!cellDom) return false;
-
-    if (!isOverflowing(cellDom)) return false;
-
-    const cellIndex = getCellIndexInRow(rowNode, rowPos, cellPos);
-    if (cellIndex < 0) return false;
-
-    const split = computeSplitPoint(view, cellDom, cellPos, cellNode);
-    if (!split) return false;
-
-    const originRowId = ensureRowId(rowNode.attrs?.rmRowId);
-
-    const tr = state.tr;
-    tr.setMeta(tableRowOverflowPluginKey, true);
-
-    if (rowNode.attrs?.rmRowId !== originRowId) {
-        tr.setNodeMarkup(rowPos, undefined, { ...rowNode.attrs, rmRowId: originRowId });
-    }
-
-    const nextRowIdExisting = (rowNode.attrs?.rmLinkedNext as string | null) ?? null;
-    const nextRowId = nextRowIdExisting ?? newId();
-
-    if (!nextRowIdExisting) {
-        const newRow = buildEmptyLinkedRow(schema, rowNode, {
-            rmRowId: nextRowId,
-            rmLinkedPrev: originRowId,
-            rmLinkedNext: null,
-        });
-
-        tr.setNodeMarkup(rowPos, undefined, {
-            ...rowNode.attrs,
-            rmRowId: originRowId,
-            rmLinkedNext: nextRowId,
-        });
-
-        const spanH = Number(cellNode.attrs?.rmRowspan ?? 1);
-        const insertPos =
-            tablePos != null ? getInsertPosAfterRowspan(tr.doc, tablePos, rowPos, spanH)
-                : (rowPos + rowNode.nodeSize);
-
-        tr.insert(insertPos, newRow);
-    }
-
-    const cellContentFrom = cellPos + 1;
-    const cellContentTo = cellPos + cellNode.nodeSize - 1;
-
-    let movedSlice: Slice | null = null;
-
-    if (split.kind === "block") {
-        const cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
-        if (cutPos >= cellContentTo) return false;
-
-        movedSlice = tr.doc.slice(cutPos, cellContentTo);
-        if (!movedSlice.content.size) return false;
-
-        tr.deleteRange(cutPos, cellContentTo);
-    } else {
-        let cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
-        cutPos = clampInlineCutAwayFromEnd(tr.doc, cutPos);
-        const $cut = tr.doc.resolve(cutPos);
-
-
-        const textblockDepth = findNearestTextblockDepth($cut);
-        if (textblockDepth == null) return false;
-
-        const tbEnd = $cut.end(textblockDepth);
-        if (cutPos >= tbEnd) return false;
-
-        const tail = tr.doc.slice(cutPos, tbEnd);
-        if (!tail.content.size) return false;
-
-        const tbType = $cut.node(textblockDepth).type;
-        const movedBlock = tbType.create(null, tail.content);
-
-        movedSlice = new Slice(Fragment.from(movedBlock), 0, 0);
-
-        tr.deleteRange(cutPos, tbEnd);
-    }
-
-    const nextRowPos = findRowPosById(tr.doc, nextRowId);
-    if (nextRowPos == null) return false;
-
-    const nextRowNode = tr.doc.nodeAt(nextRowPos);
-    if (nextRowNode?.type.name === NODE_ROW) {
-        const prev = (nextRowNode.attrs?.rmLinkedPrev as string | null) ?? null;
-        if (prev !== originRowId) {
-            tr.setNodeMarkup(nextRowPos, undefined, {
-                ...nextRowNode.attrs,
-                rmLinkedPrev: originRowId,
-            });
+    if (cellNode.childCount > 0) {
+        const last = cellNode.child(cellNode.childCount - 1);
+        if (isEmptyParagraph(last)) {
+            insertPos -= last.nodeSize;
         }
     }
+    return insertPos;
+};
 
-    const targetCellPos = getCellPosInRow(tr.doc, nextRowPos, cellIndex);
-    if (targetCellPos == null) return false;
+const pullUpOneBlockFromLinkedRow = (view: EditorView) => {
+    const { state } = view;
 
-    const targetCellNode = tr.doc.nodeAt(targetCellPos);
-    if (!targetCellNode) return false;
+    const row = findRow(state);
+    const cell = findCell(state);
+    if (!row || !cell) return false;
 
-    const targetFrom = targetCellPos + 1;
-    const targetTo = targetCellPos + targetCellNode.nodeSize - 1;
+    const mainRowId = getMainRowId(row.node);
+    if (!mainRowId) return false;
 
-    const closed = new Slice(movedSlice!.content, 0, 0);
-    const emptyPlaceholder = isEmptyPlaceholderCell(targetCellNode);
+    const colIndex = colIndexInDomRow(view) ?? state.selection.$from.index(row.depth);
 
-    const insertFrom = targetFrom;
-    if (emptyPlaceholder) {
-        tr.replaceRange(targetFrom, targetTo, closed);
-    } else {
-        tr.replaceRange(targetFrom, targetFrom, closed); // prepend
+    const nextRow = getNextLinkedRow(state, row.pos, row.node, mainRowId);
+    if (!nextRow) return false;
+
+    const currCellEl = currentCellEl(view);
+    if (!currCellEl) return false;
+
+    const currContent =
+        (currCellEl.querySelector(".rm-cell-content") as HTMLElement | null) ?? currCellEl;
+
+    const available = LIMIT - getHeight(cell.node, currContent);
+    if (available < PULL_GAP) return false;
+
+    const nextCell = getCellAtRowPos(state.doc, nextRow.pos, colIndex);
+    if (!nextCell) return false;
+
+    const movable = firstNonEmptyBlock(nextCell.node);
+    if (!movable) return false;
+
+    const nextCellDom = view.nodeDOM(nextCell.pos) as HTMLElement | null;
+    const nextContent =
+        (nextCellDom?.querySelector?.(".rm-cell-content") as HTMLElement | null) ?? nextCellDom;
+
+    const blockEl = (nextContent?.children[movable.index] as HTMLElement | undefined) ?? null;
+    const blockH = blockEl?.getBoundingClientRect().height ?? 0;
+
+    if (blockH && blockH > available - PULL_MARGIN) return false;
+
+    let blockPos = nextCell.pos + 1;
+    for (let i = 0; i < movable.index; i++) blockPos += nextCell.node.child(i).nodeSize;
+
+    const blockNode = movable.node;
+
+    let tr = state.tr;
+
+    tr = tr.delete(blockPos, blockPos + blockNode.nodeSize);
+
+    const mappedNextCellPos = tr.mapping.map(nextCell.pos);
+    tr = ensureCellHasAtLeastOneParagraph(tr, mappedNextCellPos, state.schema);
+
+    const currCell = findCell(({ ...state, doc: tr.doc } as any));
+    if (!currCell) return false;
+
+    const insertAt = cellInsertPosAtEnd(currCell.pos, currCell.node);
+    tr = tr.insert(insertAt, blockNode);
+
+    const mappedNextRowPos = tr.mapping.map(nextRow.pos);
+    const nextRowNow = tr.doc.nodeAt(mappedNextRowPos);
+
+    if (nextRowNow && isRowNode(nextRowNow) && isRowEffectivelyEmpty(nextRowNow)) {
+        tr = tr.delete(mappedNextRowPos, mappedNextRowPos + nextRowNow.nodeSize);
     }
 
-    const insertedSize = closed.content.size;
-    const insertedTo = insertFrom + insertedSize;
+    view.dispatch(tr.scrollIntoView());
+    return true;
+};
 
-    const cursorPos =
-        findLastEditablePosInRange(tr.doc, insertFrom, insertedTo) ??
-        findFirstTextPosInsideCell(tr.doc, targetCellPos) ??
-        insertFrom;
+const isCellEffectivelyEmpty = (cellNode: any) => {
+    if (!cellNode) return true;
 
-    const moveSelection = opts?.moveSelection ?? true;
-    const oldSelection = state.selection;
+    if (cellNode.childCount === 0) return true;
 
-    if (moveSelection) {
-        tr.setSelection(TextSelection.create(tr.doc, clamp(cursorPos, 0, tr.doc.content.size)));
-    } else {
-        const mapped = oldSelection.map(tr.doc, tr.mapping);
-        tr.setSelection(mapped);
+    for (let i = 0; i < cellNode.childCount; i++) {
+        const ch = cellNode.child(i);
+        if (ch.type?.name !== "paragraph") return false;
+        if (ch.content.size > 0) return false;
     }
+    return true;
+};
 
-    onApplyStart();
-    try {
-        view.dispatch(tr);
-        return true;
-    } finally {
-        requestAnimationFrame(() => onApplyEnd());
+const isRowEffectivelyEmpty = (rowNode: any) => {
+    if (!rowNode) return true;
+
+    for (let i = 0; i < rowNode.childCount; i++) {
+        const cell = rowNode.child(i);
+        if (!isNormalCell(cell)) return false;
+
+        if (!isCellEffectivelyEmpty(cell)) return false;
     }
-}
+    return true;
+};
 
-function getTableContextAtPos(
-    state: any,
-    pos: number,
-): {
-    cellPos: number;
-    cellNode: PMNode;
-    rowPos: number;
-    rowNode: PMNode;
-    tablePos: number
-    tableNode: PMNode | null;
-} | null {
-    const $pos = state.doc.resolve(pos);
+const ensureCellHasAtLeastOneParagraph = (tr: any, cellPos: number, schema: any) => {
+    const cellNode = tr.doc.nodeAt(cellPos);
+    if (!cellNode) return tr;
 
-    let cellPos: number | null = null;
-    let cellNode: PMNode | null = null;
+    if (cellNode.childCount > 0) return tr;
 
-    let rowPos: number | null = null;
-    let rowNode: PMNode | null = null;
-    let tablePos: number | null = null;
-    let tableNode: PMNode | null = null;
+    const p = schema.nodes.paragraph?.createAndFill?.();
+    if (!p) return tr;
 
-    for (let d = $pos.depth; d > 0; d--) {
-        const n = $pos.node(d);
+    return tr.insert(cellPos + 1, p);
+};
 
-        if (!cellNode && (n.type.name === "tableCell" || n.type.name === "tableHeader")) {
-            cellNode = n;
-            cellPos = $pos.before(d);
-        }
-
-        if (!rowNode && n.type.name === "tableRow") {
-            rowNode = n;
-            rowPos = $pos.before(d);
-        }
-
-        if (!tableNode && n.type.name === "table") {
-            tableNode = n;
-            tablePos = $pos.before(d);
-        }
-    }
-
-    if (cellPos == null || !cellNode || rowPos == null || !rowNode || tablePos == null) return null;
-    return { cellPos, cellNode, rowPos, rowNode, tablePos, tableNode };
-}
-
-function paginateCellAtContext(
-    view: EditorView,
-    ctx: { cellPos: number; cellNode: PMNode; rowPos: number; rowNode: PMNode; tablePos: number; tableNode: PMNode | null },
-    cellDom: HTMLElement,
-    onApplyStart: () => void,
-    onApplyEnd: () => void,
-): boolean {
-    const state = view.state;
-    const { schema } = state;
-    const { cellPos, cellNode, rowPos, rowNode, tableNode } = ctx;
-
-    if (tableNode?.attrs?.locked) return false;
-    if (!isOverflowing(cellDom)) return false;
-
-    const cellIndex = getCellIndexInRow(rowNode, rowPos, cellPos);
-    if (cellIndex < 0) return false;
-
-    const split = computeSplitPoint(view, cellDom, cellPos, cellNode);
-    if (!split) return false;
-
-    const originRowId = ensureRowId(rowNode.attrs?.rmRowId);
-
-    const tr = state.tr;
-    tr.setMeta(tableRowOverflowPluginKey, true);
-
-    if (rowNode.attrs?.rmRowId !== originRowId) {
-        tr.setNodeMarkup(rowPos, undefined, { ...rowNode.attrs, rmRowId: originRowId });
-    }
-
-    const nextRowIdExisting = (rowNode.attrs?.rmLinkedNext as string | null) ?? null;
-    const nextRowId = nextRowIdExisting ?? newId();
-
-    if (!nextRowIdExisting) {
-        const newRow = buildEmptyLinkedRow(schema, rowNode, {
-            rmRowId: nextRowId,
-            rmLinkedPrev: originRowId,
-            rmLinkedNext: null,
-        });
-
-        tr.setNodeMarkup(rowPos, undefined, {
-            ...rowNode.attrs,
-            rmRowId: originRowId,
-            rmLinkedNext: nextRowId,
-        });
-
-        const spanH = Number(cellNode.attrs?.rmRowspan ?? 1);
-        const insertPos = getInsertPosAfterRowspan(tr.doc, ctx.tablePos, rowPos, spanH);
-        tr.insert(insertPos, newRow);    }
-
-    const cellContentFrom = cellPos + 1;
-    const cellContentTo = cellPos + cellNode.nodeSize - 1;
-
-    let movedSlice: Slice | null = null;
-
-    if (split.kind === "block") {
-        const cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
-        if (cutPos >= cellContentTo) return false;
-
-        movedSlice = tr.doc.slice(cutPos, cellContentTo);
-        if (!movedSlice.content.size) return false;
-
-        tr.deleteRange(cutPos, cellContentTo);
-    } else {
-        let cutPos = clamp(split.cutPos, cellContentFrom, cellContentTo);
-        cutPos = clampInlineCutAwayFromEnd(tr.doc, cutPos);
-        const $cut = tr.doc.resolve(cutPos);
-
-
-        const textblockDepth = findNearestTextblockDepth($cut);
-        if (textblockDepth == null) return false;
-
-        const tbEnd = $cut.end(textblockDepth);
-        if (cutPos >= tbEnd) return false;
-
-        const tail = tr.doc.slice(cutPos, tbEnd);
-        if (!tail.content.size) return false;
-
-        const tbType = $cut.node(textblockDepth).type;
-        const movedBlock = tbType.create(null, tail.content);
-        movedSlice = new Slice(Fragment.from(movedBlock), 0, 0);
-
-        tr.deleteRange(cutPos, tbEnd);
-    }
-
-    const nextRowPos = findRowPosById(tr.doc, nextRowId);
-    if (nextRowPos == null) return false;
-
-    const nextRowNode = tr.doc.nodeAt(nextRowPos);
-    if (nextRowNode?.type.name === NODE_ROW) {
-        const prev = (nextRowNode.attrs?.rmLinkedPrev as string | null) ?? null;
-        if (prev !== originRowId) {
-            tr.setNodeMarkup(nextRowPos, undefined, {
-                ...nextRowNode.attrs,
-                rmLinkedPrev: originRowId,
-            });
-        }
-    }
-
-    const targetCellPos = getCellPosInRow(tr.doc, nextRowPos, cellIndex);
-    if (targetCellPos == null) return false;
-
-    const targetCellNode = tr.doc.nodeAt(targetCellPos);
-    if (!targetCellNode) return false;
-
-    const targetFrom = targetCellPos + 1;
-    const targetTo = targetCellPos + targetCellNode.nodeSize - 1;
-
-    const closed = new Slice(movedSlice!.content, 0, 0);
-
-    if (isEmptyPlaceholderCell(targetCellNode)) {
-        tr.replaceRange(targetFrom, targetTo, closed);
-    } else {
-        tr.replaceRange(targetFrom, targetFrom, closed); // prepend
-    }
-
-    // keep selection (toolbar formatting)
-    tr.setSelection(state.selection.map(tr.doc, tr.mapping));
-
-    if (!tr.steps.length) return false;
-
-    onApplyStart();
-    try {
-        view.dispatch(tr);
-        return true;
-    } finally {
-        requestAnimationFrame(() => onApplyEnd());
-    }
-}
-
-
-
-function maybePaginateFirstOverflowInEditor(
-    view: EditorView,
-    onApplyStart: () => void,
-    onApplyEnd: () => void,
-): boolean {
-    const root = view.dom as HTMLElement;
-
-    const cells = Array.from(
-        root.querySelectorAll<HTMLElement>("table.table-plus td, table.table-plus th"),
-    );
-
-    const overflowing = cells.find((el) => {
-        const cs = getComputedStyle(el);
-        if (cs.display === "none" || cs.visibility === "hidden") return false;
-        if (el.getAttribute("data-rm-merged-to")) return false; // optional
-        return isOverflowing(el);
-    });
-
-    if (!overflowing) return false;
-
-    let pos: number;
-    try {
-        const anchor = (overflowing.querySelector(".rm-cell-content") ?? overflowing) as HTMLElement;
-        pos = view.posAtDOM(anchor, 0);
-    } catch {
-        return false;
-    }
-
-    const ctx = getTableContextAtPos(view.state, pos);
-    if (!ctx) return false;
-
-    return paginateCellAtContext(view, ctx, overflowing, onApplyStart, onApplyEnd);
-}
-
-
-function maybePaginateFirstOverflowInCurrentTable(
-    view: EditorView,
-    onApplyStart: () => void,
-    onApplyEnd: () => void,
-): boolean {
-    const state = view.state;
-
-    const anchorCell = getActiveCellDom(view);
-    if (!anchorCell) return false;
-
-    const tableEl = anchorCell.closest("table.table-plus") as HTMLElement | null;
-    if (!tableEl) return false;
-
-    const cells = Array.from(tableEl.querySelectorAll("td,th")) as HTMLElement[];
-
-    const overflowing = cells.find((el) => {
-        const cs = getComputedStyle(el);
-        if (cs.display === "none" || cs.visibility === "hidden") return false;
-
-        // skip covered merged cells if you want (optional safety)
-        if (el.getAttribute("data-rm-merged-to")) return false;
-
-        return isOverflowing(el);
-    });
-
-    if (!overflowing) return false;
-
-    // Convert DOM cell to PM position
-    let pos: number;
-    try {
-        const anchor = (overflowing.querySelector(".rm-cell-content") ?? overflowing) as HTMLElement;
-        pos = view.posAtDOM(anchor, 0);
-    } catch {
-        return false;
-    }
-
-    const ctx = getTableContextAtPos(state, pos);
-    if (!ctx) return false;
-
-    // paginate this overflowing cell but KEEP selection
-    return paginateCellAtContext(view, ctx, overflowing, onApplyStart, onApplyEnd);
-}
-
-
-/* -------------------------------- shared helpers -------------------------------- */
-
-function getSelectionTableContext(state: any): {
-    cellPos: number;
-    cellNode: PMNode;
-    rowPos: number;
-    rowNode: PMNode;
-    tablePos: number;
-    tableNode: PMNode | null;
-} | null {
-    const $from = state.selection.$from;
-
-    let cellPos: number | null = null;
-    let cellNode: PMNode | null = null;
-
-    let rowPos: number | null = null;
-    let rowNode: PMNode | null = null;
-    let tablePos: number | null = null;
-
-    let tableNode: PMNode | null = null;
-
-    for (let d = $from.depth; d > 0; d--) {
-        const n = $from.node(d);
-
-        if (!cellNode && (n.type.name === NODE_CELL || n.type.name === NODE_HEADER)) {
-            cellNode = n;
-            cellPos = $from.before(d);
-        }
-        if (!rowNode && n.type.name === NODE_ROW) {
-            rowNode = n;
-            rowPos = $from.before(d);
-        }
-        if (!tableNode && n.type.name === NODE_TABLE) {
-            tableNode = n;
-            tablePos = $from.before(d);
-        }
-    }
-
-    if (cellPos == null || !cellNode || rowPos == null || !rowNode || tablePos == null) return null;
-    return { cellPos, cellNode, rowPos, rowNode, tablePos, tableNode };
-}
-
-
-function getContentHeightPxFromBlocks(content: HTMLElement): number {
+const getContentHeightPxFromBlocks = (content: HTMLElement): number => {
     const blocks = Array.from(content.children) as HTMLElement[];
     if (!blocks.length) return 0;
 
@@ -918,7 +360,6 @@ function getContentHeightPxFromBlocks(content: HTMLElement): number {
         const cs = getComputedStyle(b);
         const mt = parseFloat(cs.marginTop || "0") || 0;
         const mb = parseFloat(cs.marginBottom || "0") || 0;
-
         top = Math.min(top, r.top - mt);
         bottom = Math.max(bottom, r.bottom + mb);
     }
@@ -929,70 +370,9 @@ function getContentHeightPxFromBlocks(content: HTMLElement): number {
 
     const h = (bottom - top) + padTop + padBottom;
     return Number.isFinite(h) ? Math.max(0, h) : content.scrollHeight;
-}
+};
 
-
-
-function isOverflowing(td: HTMLElement) {
-    const viewport = getCellViewportEl(td);
-    const content = td.querySelector<HTMLElement>(".rm-cell-content");
-    if (!isMergeOriginDomCell(td) || !content) {
-        const tdOverflow = td.scrollHeight > td.clientHeight + 1;
-        const contentOverflow = content ? content.scrollHeight > content.clientHeight + 1 : false;
-        const viewportOverflow = viewport.scrollHeight > viewport.clientHeight + 1;
-        return tdOverflow || contentOverflow || viewportOverflow;
-    }
-
-    const contentHeightPx = getContentHeightPxFromBlocks(content);
-
-    return contentHeightPx > 800;
-}
-
-
-
-function getSplitBoundaryBottomY(td: HTMLElement): number {
-    const content = td.querySelector<HTMLElement>(".rm-cell-content");
-    if (isMergeOriginDomCell(td) && content) {
-        const r = content.getBoundingClientRect();
-        const cs = getComputedStyle(content);
-        const padBottom = parseFloat(cs.paddingBottom || "0") || 0;
-        return r.top + 921 - padBottom;
-    }
-
-    // normal cells
-    const viewportEl = getCellViewportEl(td);
-    const vr = viewportEl.getBoundingClientRect();
-    const vcs = getComputedStyle(viewportEl);
-    const padBottom = parseFloat(vcs.paddingBottom || "0") || 0;
-    return vr.bottom - padBottom;
-}
-
-function isMergeOriginDomCell(td: HTMLElement): boolean {
-    return td.getAttribute("data-rm-merge-origin") === "true";
-}
-
-function getCellViewportEl(td: HTMLElement): HTMLElement {
-    // merge-origin: viewport الحقيقي هو rm-cell-content (absolute)
-    const content = td.querySelector<HTMLElement>(".rm-cell-content");
-    if (isMergeOriginDomCell(td) && content) return content;
-    return td;
-}
-
-function collectRowPositionsInTable(doc: PMNode, tablePos: number): number[] {
-    const table = doc.nodeAt(tablePos);
-    if (!table || table.type.name !== NODE_TABLE) return [];
-
-    const rows: number[] = [];
-    table.descendants((node, relPos) => {
-        if (node.type.name === NODE_ROW) rows.push(tablePos + 1 + relPos);
-        return true;
-    });
-
-    rows.sort((a, b) => a - b);
-    return rows;
-}
-
-function getInsertPosAfterRowspan(doc: PMNode, tablePos: number, originRowPos: number, spanH: number): number {
+const getInsertPosAfterRowspan = (doc: PMNode, tablePos: number, originRowPos: number, spanH: number): number => {
     const rows = collectRowPositionsInTable(doc, tablePos);
     const originRowNode = doc.nodeAt(originRowPos);
     if (!originRowNode) return originRowPos;
@@ -1008,470 +388,184 @@ function getInsertPosAfterRowspan(doc: PMNode, tablePos: number, originRowPos: n
     return lastRowPos + lastRowNode.nodeSize;
 }
 
-function clampInlineCutAwayFromEnd(doc: PMNode, cutPos: number): number {
-    const $cut = doc.resolve(cutPos);
-    const d = findNearestTextblockDepth($cut);
-    if (d == null) return cutPos;
+const collectRowPositionsInTable = (doc: PMNode, tablePos: number): number[] => {
+    const table = doc.nodeAt(tablePos);
+    if (!table || table.type.name !== 'table') return [];
 
-    const end = $cut.end(d);
-    const start = $cut.start(d);
-
-    // If tail is too small, move cut earlier
-    if (end - cutPos <= 3) {
-        return Math.max(start + 1, end - 80); // move ~80 positions up (tune)
-    }
-    return cutPos;
-}
-
-function cleanupEmptyLinkedRowInTr(tr: Transaction, currentRowId: string, nextRowId: string) {
-    const nextRowPos = findRowPosById(tr.doc, nextRowId);
-    if (nextRowPos == null) return;
-
-    const nextRowNode = tr.doc.nodeAt(nextRowPos);
-    if (!nextRowNode || nextRowNode.type.name !== NODE_ROW) return;
-
-    if (!isRowCompletelyEmpty(nextRowNode)) return;
-
-    const nextNextId = asStringOrNull(nextRowNode.attrs?.rmLinkedNext);
-
-    // delete next row
-    tr.deleteRange(nextRowPos, nextRowPos + nextRowNode.nodeSize);
-
-    // relink current -> nextNext
-    const currentRowPos = findRowPosById(tr.doc, currentRowId);
-    if (currentRowPos != null) {
-        safeSetNodeMarkup(tr, currentRowPos, NODE_ROW, (attrs) => ({
-            ...attrs,
-            rmLinkedNext: nextNextId ?? null,
-        }));
-    }
-
-    // update nextNext.prev -> current
-    if (nextNextId) {
-        const nextNextPos = findRowPosById(tr.doc, nextNextId);
-        if (nextNextPos != null) {
-            safeSetNodeMarkup(tr, nextNextPos, NODE_ROW, (attrs) => ({
-                ...attrs,
-                rmLinkedPrev: currentRowId,
-            }));
-        }
-    }
-}
-
-
-function getCellAvailableCapacityPx(td: HTMLElement) {
-    const cs = getComputedStyle(td);
-
-    // maxHeight is set by your CSS: max-height: var(--rm-max-content-child-height)
-    const maxH = cs.maxHeight;
-    const maxHeightPx =
-        maxH && maxH !== "none" && !Number.isNaN(parseFloat(maxH))
-            ? parseFloat(maxH)
-            : td.clientHeight;
-
-    // scrollHeight reflects content height
-    const capacity = maxHeightPx - td.scrollHeight;
-    return Math.max(0, capacity);
-}
-
-
-function getActiveCellDom(view: EditorView): HTMLElement | null {
-    const { node } = view.domAtPos(view.state.selection.from);
-    let el: HTMLElement | null =
-        node.nodeType === Node.TEXT_NODE ? (node.parentElement as HTMLElement) : (node as HTMLElement);
-
-    while (el) {
-        if (el.tagName === "TD" || el.tagName === "TH") return el;
-        el = el.parentElement;
-    }
-    return null;
-}
-
-function getCellDomByPos(view: EditorView, pos: number): HTMLElement | null {
-    try {
-        const dom = view.nodeDOM(pos) as HTMLElement | null;
-        if (!dom) return null;
-        if (dom.tagName === "TD" || dom.tagName === "TH") return dom;
-        // sometimes nodeDOM returns inner; climb
-        let el: HTMLElement | null = dom;
-        while (el) {
-            if (el.tagName === "TD" || el.tagName === "TH") return el;
-            el = el.parentElement;
-        }
-        return null;
-    } catch {
-        return null;
-    }
-}
-
-function getCellIndexInRow(rowNode: PMNode, rowPos: number, cellPos: number) {
-    const rowContentStart = rowPos + 1;
-    const rel = cellPos - rowContentStart;
-    if (rel < 0) return -1;
-
-    let offset = 0;
-    for (let i = 0; i < rowNode.childCount; i++) {
-        if (offset === rel) return i;
-        offset += rowNode.child(i).nodeSize;
-    }
-    return -1;
-}
-
-function getCellPosInRow(doc: PMNode, rowPos: number, cellIndex: number) {
-    const row = doc.nodeAt(rowPos);
-    if (!row || row.type.name !== NODE_ROW) return null;
-    if (cellIndex < 0 || cellIndex >= row.childCount) return null;
-
-    let p = rowPos + 1;
-    for (let i = 0; i < cellIndex; i++) p += row.child(i).nodeSize;
-    return p;
-}
-
-function findRowPosById(doc: PMNode, id: string) {
-    let found: number | null = null;
-    doc.descendants((node, pos) => {
-        if (node.type.name === NODE_ROW && node.attrs?.rmRowId === id) {
-            found = pos;
-            return false;
-        }
+    const rows: number[] = [];
+    table.descendants((node, relPos) => {
+        if (node.type.name === 'tableRow') rows.push(tablePos + 1 + relPos);
         return true;
     });
-    return found;
+
+    rows.sort((a, b) => a - b);
+    return rows;
 }
 
-function asStringOrNull(v: unknown): string | null {
-    if (v == null) return null;
-    const s = String(v).trim();
-    return s.length ? s : null;
+const getHeight = (node:any, content: HTMLElement) => {
+    if (isNormalCell(node)){
+        return content.scrollHeight
+    }
+    return getContentHeightPxFromBlocks(content)
 }
 
-function safeSetNodeMarkup(
-    tr: Transaction,
-    pos: number,
-    expectedTypeName: string,
-    patch: (attrs: Record<string, any>) => Record<string, any>,
-) {
-    const node = tr.doc.nodeAt(pos);
-    if (!node || node.type.name !== expectedTypeName) return;
-    tr.setNodeMarkup(pos, undefined, patch({ ...node.attrs }));
-}
+const findTable = (state: EditorState) => {
+    const { $from } = state.selection as any;
+    for (let d = $from.depth; d > 0; d--) {
+        const n = $from.node(d);
+        const role = n.type?.spec?.tableRole;
+        if (n.type?.name === "table" || role === "table") {
+            return { node: n, pos: $from.before(d), depth: d };
+        }
+    }
+    return null;
+};
 
-function ensureRowId(existing: string | null | undefined) {
-    return existing && String(existing).trim().length ? String(existing) : newId();
-}
 
-function newId() {
-    const c: any = globalThis as any;
-    if (c.crypto?.randomUUID) return c.crypto.randomUUID();
-    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
 
-function buildEmptyLinkedRow(
-    schema: any,
-    fromRow: PMNode,
-    attrs: { rmRowId: string; rmLinkedPrev: string | null; rmLinkedNext: string | null },
-) {
-    const nextAttrs = { ...fromRow.attrs, ...attrs };
+const getMainIdFromRow = (rowNode: any): string | null => {
+    return (rowNode?.attrs?.rmRowId as string | null) ?? null;
+};
 
-    const cells = [];
-    for (let i = 0; i < fromRow.childCount; i++) {
-        const c = fromRow.child(i);
-        const cellType = c.type;
-        const safeAttrs = {
-            ...c.attrs,
-            rmMergedTo: null,
-            rmMergeOrigin: false,
-            rmHideMode: null,
-            rmRowspan: 1,
-            rmColspan: 1,
-            rmCellId: null,
+const collectMainRowIds = (doc: PMNode): Set<string> => {
+    const ids = new Set<string>();
+    doc.descendants((node) => {
+        if (!isRowNode(node)) return true;
+        const id = getMainIdFromRow(node);
+        if (id) ids.add(String(id));
+        return true;
+    });
+    return ids;
+};
+
+const deleteLinkedRowsForMainIds = (
+    oldState: EditorState,
+    newState: EditorState,
+) => {
+    const oldMainIds = collectMainRowIds(oldState.doc as any);
+    if (oldMainIds.size === 0) return null;
+
+    const newMainIds = collectMainRowIds(newState.doc as any);
+
+    const deletedMainIds: string[] = [];
+    for (const id of oldMainIds) {
+        if (!newMainIds.has(id)) deletedMainIds.push(id);
+    }
+    if (deletedMainIds.length === 0) return null;
+
+    const toDelete: Array<{ pos: number; size: number }> = [];
+
+    newState.doc.descendants((node, pos) => {
+        if (!isRowNode(node)) return true;
+
+        const linkedTo = node.attrs?.rmLinkedTo as string | null;
+        const rowId = node.attrs?.rmRowId as string | null;
+
+        if (linkedTo && deletedMainIds.includes(String(linkedTo))) {
+            toDelete.push({ pos, size: node.nodeSize });
+        }
+
+        if (rowId && deletedMainIds.includes(String(rowId))) {
+            toDelete.push({ pos, size: node.nodeSize });
+        }
+
+        return true;
+    });
+
+    if (toDelete.length === 0) return null;
+
+    toDelete.sort((a, b) => b.pos - a.pos);
+
+    const tr = newState.tr;
+    tr.setMeta(RM_CLEANUP_META, true);
+
+    for (const d of toDelete) {
+        const p = tr.mapping.map(d.pos);
+        const n = tr.doc.nodeAt(p);
+        if (n && isRowNode(n)) {
+            tr.deleteRange(p, p + n.nodeSize);
+        }
+    }
+
+    return tr.steps.length ? tr : null;
+};
+
+export const TableRowOverflow = new Plugin({
+    key: TableRowOverflowKey,
+    appendTransaction(transactions, oldState, newState) {
+        if (transactions.some(t => t.getMeta(RM_CLEANUP_META))) return null;
+        if (!transactions.some(t => t.docChanged)) return null;
+        return deleteLinkedRowsForMainIds(oldState, newState);
+    },
+
+    props: {
+        handlePaste(view, event, slice) {
+            if (!inCell(view.state)) return false;
+
+            const cell = findCell(view.state);
+            if (!cell) return false;
+
+            const cellEl = currentCellEl(view);
+            if (!cellEl) return false;
+
+            const content = (cellEl.querySelector(".rm-cell-content") as HTMLElement | null) ?? cellEl;
+
+            const text = event.clipboardData?.getData("text/plain") ?? "";
+            const addedHeight = measureTextHeight(content, text) ?? 0;
+            const shouldRedirect = getHeight(cell.node, content) + addedHeight >= LIMIT
+            if (!shouldRedirect) return false;
+            event.preventDefault();
+
+            const baseTr = buildGotoOrInsertTr(view);
+            if (!baseTr) return false;
+
+            view.dispatch(baseTr.replaceSelection(slice).scrollIntoView());
+            view.focus();
+            return true;
+        },
+    },
+
+    view() {
+        let lastRowKey = "";
+        let wasOver = false;
+
+        return {
+            update(view: EditorView, prevState: EditorState) {
+                if (view.state.doc.eq(prevState.doc)) return;
+                if (!inCell(view.state)) return;
+
+                requestAnimationFrame(() => {
+                    const row = findRow(view.state);
+                    const cell = findCell(view.state);
+                    if (!row || !cell) return;
+
+                    const key = String(row.node.attrs?.rmLinkedTo || row.node.attrs?.rmRowId || row.pos);
+                    if (key !== lastRowKey) {
+                        lastRowKey = key;
+                        wasOver = false;
+                    }
+
+                    const cellEl = currentCellEl(view);
+                    if (!cellEl) return;
+                    const content = (cellEl.querySelector(".rm-cell-content") as HTMLElement | null) ?? cellEl;
+                    const height = getHeight(cell.node, content);
+
+                    const over = height >= LIMIT;
+                    const under = height <= (LIMIT - PULL_GAP);
+                    if (over && !wasOver) {
+                        const ok = insertOrGotoLinkedRow(view);
+                        if (ok) wasOver = true;
+                    }
+
+                    if (!over) wasOver = false;
+
+                    if (under) {
+                        pullUpOneBlockFromLinkedRow(view);
+                    }
+
+                });
+            },
+            destroy() {},
         };
-        const empty = cellType.createAndFill(safeAttrs);
-        cells.push(empty);
-    }
-
-    return schema.nodes.tableRow.create(nextAttrs, cells);
-}
-
-function isEmptyPlaceholderCell(cellNode: PMNode) {
-    if (cellNode.childCount !== 1) return false;
-    const only = cellNode.child(0);
-    if (!only.isTextblock) return false;
-    return only.content.size === 0 && !only.textContent;
-}
-
-function isCellCompletelyEmpty(cellNode: PMNode) {
-    // Treat "placeholder empty paragraph" as empty; also treat whitespace-only as empty
-    if (cellNode.childCount === 0) return true;
-    if (cellNode.childCount === 1 && isEmptyPlaceholderCell(cellNode)) return true;
-    return cellNode.textContent.trim().length === 0 && allChildrenAreEmptyTextblocks(cellNode);
-}
-
-function allChildrenAreEmptyTextblocks(cellNode: PMNode) {
-    for (let i = 0; i < cellNode.childCount; i++) {
-        const ch = cellNode.child(i);
-        if (!ch.isTextblock) return false;
-        if (ch.textContent.trim().length !== 0) return false;
-        // if it has non-text inline nodes, treat as non-empty
-        let hasInline = false;
-        ch.descendants((n) => {
-            if (n.isInline && !n.isText) {
-                hasInline = true;
-                return false;
-            }
-            return true;
-        });
-        if (hasInline) return false;
-    }
-    return true;
-}
-
-function isRowCompletelyEmpty(rowNode: PMNode) {
-    for (let i = 0; i < rowNode.childCount; i++) {
-        const cell = rowNode.child(i);
-        if (!isCellCompletelyEmpty(cell)) return false;
-    }
-    return true;
-}
-
-function getFirstMeaningfulBlockIndex(cellNode: PMNode): number | null {
-    for (let i = 0; i < cellNode.childCount; i++) {
-        const ch = cellNode.child(i);
-        if (!ch.isTextblock) return i; // list/table etc => treat meaningful
-        if (ch.textContent.trim().length > 0) return i;
-        // allow inline nodes
-        let hasInline = false;
-        ch.descendants((n) => {
-            if (n.isInline && !n.isText) {
-                hasInline = true;
-                return false;
-            }
-            return true;
-        });
-        if (hasInline) return i;
-    }
-    return null;
-}
-
-function getCellChildRange(cellPos: number, cellNode: PMNode, childIndex: number) {
-    if (childIndex < 0 || childIndex >= cellNode.childCount) return null;
-    const start = cellPos + 1;
-    let offset = 0;
-    for (let i = 0; i < childIndex; i++) offset += cellNode.child(i).nodeSize;
-    const from = start + offset;
-    const to = from + cellNode.child(childIndex).nodeSize;
-    return { from, to };
-}
-
-
-function findFirstTextPosInsideCell(doc: PMNode, cellPos: number) {
-    const cell = doc.nodeAt(cellPos);
-    if (!cell) return null;
-
-    const from = cellPos + 1;
-    let found: number | null = null;
-
-    cell.descendants((node, pos) => {
-        if (node.isTextblock) {
-            found = from + pos + 1;
-            return false;
-        }
-        return true;
-    });
-
-    return found;
-}
-
-function findLastEditablePosInRange(doc: PMNode, from: number, to: number) {
-    let lastTextPos: number | null = null;
-    let lastTextblockEnd: number | null = null;
-
-    doc.nodesBetween(from, to, (node, pos) => {
-        if (node.isText) lastTextPos = pos + node.nodeSize;
-        else if (node.isTextblock) lastTextblockEnd = pos + node.nodeSize - 1;
-        return true;
-    });
-
-    return lastTextPos ?? lastTextblockEnd;
-}
-
-function clamp(n: number, min: number, max: number) {
-    return Math.max(min, Math.min(max, n));
-}
-
-function getCaretAtPoint(x: number, y: number): { node: Node; offset: number } | null {
-    const anyDoc = document as any;
-
-    if (typeof anyDoc.caretPositionFromPoint === "function") {
-        const pos = anyDoc.caretPositionFromPoint(x, y);
-        if (!pos) return null;
-        return { node: pos.offsetNode, offset: pos.offset };
-    }
-
-    if (typeof anyDoc.caretRangeFromPoint === "function") {
-        const range = anyDoc.caretRangeFromPoint(x, y);
-        if (!range) return null;
-        return { node: range.startContainer, offset: range.startOffset };
-    }
-
-    return null;
-}
-
-function computeSplitPoint(
-    view: EditorView,
-    cellDom: HTMLElement,
-    cellPos: number,
-    cellNode: PMNode,
-): { kind: "block"; cutPos: number } | { kind: "inline"; cutPos: number } | null {
-    const content = cellDom.querySelector(".rm-cell-content") as HTMLElement | null;
-    if (!content) return null;
-
-    const viewportEl = getCellViewportEl(cellDom);
-    const viewportRect = viewportEl.getBoundingClientRect();
-    const cs = getComputedStyle(viewportEl);
-    const padBottom = parseFloat(cs.paddingBottom || "0");
-
-    let innerBottom: number;
-    if (isMergeOriginDomCell(cellDom)) {
-        innerBottom = viewportRect.top + 921 - padBottom; // todo check it issue rowspan
-    } else {
-        innerBottom = viewportRect.bottom - padBottom;
-    }
-
-    const blocks = Array.from(content.children) as HTMLElement[];
-    let lastFullyVisible = -1;
-
-    for (let i = 0; i < blocks.length; i++) {
-        const r = blocks[i]!.getBoundingClientRect();
-        if (r.bottom <= innerBottom + 0.5) lastFullyVisible = i;
-        else break;
-    }
-
-    if (lastFullyVisible >= 0 && lastFullyVisible < blocks.length - 1) {
-        const idx = Math.min(lastFullyVisible, Math.max(0, cellNode.childCount - 1));
-        const cutPos = cutPosAfterBlockIndex(cellPos, cellNode, idx);
-        return { kind: "block", cutPos };
-    }
-
-    const isRTL = getComputedStyle(view.dom).direction === "rtl";
-    const x = isRTL ? viewportRect.right - 6 : viewportRect.left + 6;
-    const y = innerBottom - 2;
-
-    const inViewport = y >= 0 && y <= window.innerHeight;
-
-    if (inViewport) {
-        const caret = getCaretAtPoint(x, y);
-        if (caret) {
-            try {
-                const pmPos = view.posAtDOM(caret.node, caret.offset);
-                return { kind: "inline", cutPos: pmPos };
-            } catch {
-                // fall through
-            }
-        }
-    }
-
-    const blockEl = blocks[0] as HTMLElement | undefined;
-    if (!blockEl) return null;
-
-    const pmPos = findInlineCutPosByDomBinarySearch(view, blockEl, innerBottom);
-    if (pmPos == null) return null;
-
-    return { kind: "inline", cutPos: pmPos };
-
-}
-
-function findInlineCutPosByDomBinarySearch(
-    view: EditorView,
-    blockEl: HTMLElement,
-    innerBottom: number,
-): number | null {
-    // Collect text nodes in this block
-    const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
-    const nodes: Text[] = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
-
-    if (nodes.length === 0) return null;
-
-    // Build index map: globalCharIndex -> (textNode, offset)
-    const segments: Array<{ node: Text; start: number; end: number }> = [];
-    let total = 0;
-    for (const n of nodes) {
-        const len = n.data.length;
-        if (len <= 0) continue;
-        segments.push({ node: n, start: total, end: total + len });
-        total += len;
-    }
-    if (total <= 1) return null;
-
-    const pointAt = (charIndex: number): { node: Text; offset: number } | null => {
-        const i = Math.max(0, Math.min(total - 1, charIndex));
-        const seg = segments.find((s) => i >= s.start && i < s.end);
-        if (!seg) return null;
-        return { node: seg.node, offset: i - seg.start };
-    };
-
-    const charBottom = (node: Text, offset: number): number => {
-        const r = document.createRange();
-        const len = node.data.length;
-
-        // pick a 1-char range to get a real rect
-        if (len === 0) return Number.POSITIVE_INFINITY;
-
-        const start = Math.max(0, Math.min(len - 1, offset));
-        const end = Math.min(len, start + 1);
-
-        r.setStart(node, start);
-        r.setEnd(node, end);
-
-        const rect = r.getBoundingClientRect();
-        return rect.bottom || Number.POSITIVE_INFINITY;
-    };
-
-    // Binary search: find the greatest char index whose rect.bottom <= innerBottom
-    let lo = 0;
-    let hi = total - 1;
-    let best = 0;
-
-    for (let iter = 0; iter < 20 && lo <= hi; iter++) {
-        const mid = (lo + hi) >> 1;
-        const p = pointAt(mid);
-        if (!p) break;
-
-        const bottom = charBottom(p.node, p.offset);
-
-        if (bottom <= innerBottom + 0.5) {
-            best = mid;
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    // Ensure not returning "start" (would move nothing)
-    best = Math.max(1, best);
-
-    const bestPoint = pointAt(best);
-    if (!bestPoint) return null;
-
-    try {
-        return view.posAtDOM(bestPoint.node, bestPoint.offset);
-    } catch {
-        return null;
-    }
-}
-
-
-function cutPosAfterBlockIndex(cellPos: number, cellNode: PMNode, blockIndex: number) {
-    const start = cellPos + 1;
-    let offset = 0;
-    for (let i = 0; i <= blockIndex; i++) offset += cellNode.child(i).nodeSize;
-    return start + offset;
-}
-
-function findNearestTextblockDepth($pos: any): number | null {
-    for (let d = $pos.depth; d > 0; d--) {
-        if ($pos.node(d).isTextblock) return d;
-    }
-    return null;
-}
+    },
+});

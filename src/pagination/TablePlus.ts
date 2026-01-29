@@ -313,7 +313,7 @@ export const TablePlus = Table.extend<TablePlusOptions>({
           return isThereUpdate ? tr : null;
         },
       }),
-      TableRowOverflow(),
+      TableRowOverflow,
     ];
   },
 });
