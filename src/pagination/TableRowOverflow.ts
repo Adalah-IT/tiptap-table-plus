@@ -123,7 +123,7 @@ const buildGotoOrInsertTr = (view: EditorView) => {
 
     const nextRow = state.doc.nodeAt(insertPos);
 
-    if (isRowNode(nextRow) && nextRow.attrs?.rmLinkedTo === mainRowId) {
+    if (isRowNode(nextRow) && nextRow?.attrs?.rmLinkedTo === mainRowId) {
         const sel = selectSameColInRow(state.doc, insertPos, colIndex);
         if (!sel) return null;
         return state.tr.setSelection(sel);
@@ -200,7 +200,7 @@ const getNextLinkedRow = (state: EditorState, rowPos: number, rowNode: any, main
         : (rowPos + rowNode.nodeSize);
 
     const nextRow = state.doc.nodeAt(nextPos);
-    if (isRowNode(nextRow) && nextRow.attrs?.rmLinkedTo === mainRowId) {
+    if (isRowNode(nextRow) && nextRow?.attrs?.rmLinkedTo === mainRowId) {
         return { pos: nextPos, node: nextRow };
     }
     return null;
@@ -267,7 +267,7 @@ const pullUpOneBlockFromLinkedRow = (view: EditorView) => {
     const available = LIMIT - getHeight(cell.node, currContent);
     if (available < PULL_GAP) return false;
 
-    const nextCell = getCellAtRowPos(state.doc, nextRow.pos, colIndex);
+    const nextCell = getCellAtRowPos(state.doc, nextRow?.pos, colIndex);
     if (!nextCell) return false;
 
     const movable = firstNonEmptyBlock(nextCell.node);
@@ -300,7 +300,7 @@ const pullUpOneBlockFromLinkedRow = (view: EditorView) => {
     const insertAt = cellInsertPosAtEnd(currCell.pos, currCell.node);
     tr = tr.insert(insertAt, blockNode);
 
-    const mappedNextRowPos = tr.mapping.map(nextRow.pos);
+    const mappedNextRowPos = tr.mapping.map(nextRow?.pos);
     const nextRowNow = tr.doc.nodeAt(mappedNextRowPos);
 
     if (nextRowNow && isRowNode(nextRowNow) && isRowEffectivelyEmpty(nextRowNow)) {
