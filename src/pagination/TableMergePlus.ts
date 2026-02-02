@@ -1,7 +1,7 @@
 import { Extension, type CommandProps } from "@tiptap/core";
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Fragment, type Node as PMNode } from "@tiptap/pm/model";
-import { TableMap } from "prosemirror-tables";
+import { CellSelection, TableMap } from 'prosemirror-tables';
 
 declare module "@tiptap/core" {
     interface Commands<ReturnType> {
@@ -9,6 +9,7 @@ declare module "@tiptap/core" {
             toggleTableMerge: () => ReturnType;
             mergeTableSelection: () => ReturnType;
             unmergeTableAtSelection: () => ReturnType;
+            deleteRowPlus: () => ReturnType;
         };
     }
 }
@@ -66,12 +67,6 @@ function emptyCellContent(schema: any) {
     const p = schema.nodes.paragraph?.createAndFill();
     if (!p) throw new Error("Schema must have paragraph node for table cells.");
     return Fragment.from(p);
-}
-
-function collectBlocks(node: PMNode): PMNode[] {
-    const blocks: PMNode[] = [];
-    node.content.forEach((child) => blocks.push(child));
-    return blocks;
 }
 
 function ensureCellIdsTr(state: any) {
@@ -390,7 +385,81 @@ export const TableMergePlus = Extension.create({
                     if (dispatch) dispatch(tr.scrollIntoView());
                     return true;
                 };
+                const deleteRowPlus = () => ({ state }: CommandProps) => {
+                    const editor = this.editor;
+                    const view = editor.view;
 
+                    const selLike: any = getCellSelectionLike(state);
+                    const $from = state.selection.$from;
+
+                    // Find the table from either the cell selection or the text cursor
+                    const tableInfo = selLike
+                        ? findAncestor(selLike.$anchorCell, isTable)
+                        : findAncestor($from, isTable);
+                    if (!tableInfo) return false;
+
+                    const tableNode = tableInfo.node;
+                    const tableStart = tableInfo.pos + 1;
+                    const map = TableMap.get(tableNode);
+
+                    let anchorCellAbs: number | null = null;
+                    if (selLike) {
+                        anchorCellAbs = selLike.$anchorCell.pos;
+                    } else {
+                        // Climb from $from to find the enclosing cell start
+                        for (let d = $from.depth; d >= 0; d--) {
+                            const n: any = $from.node(d);
+                            if (isCell(n)) {
+                                anchorCellAbs = $from.before(d);
+                                break;
+                            }
+                        }
+                    }
+                    if (anchorCellAbs == null) return false;
+
+                    const posInTable = anchorCellAbs - tableStart;
+                    const idx = map.map.indexOf(posInTable);
+                    if (idx < 0) return false;
+                    const rowIndex = Math.floor(idx / map.width);
+
+                    // Scan the row for merges intersecting it
+                    type Target = { abs: number; originId: string };
+                    const targets: Target[] = [];
+                    const seen = new Set<string>();
+
+                    for (let c = 0; c < map.width; c++) {
+                        const cellPosInTable = map.map[rowIndex * map.width + c];
+                        const abs = tableStart + cellPosInTable;
+                        const n: any = state.doc.nodeAt(abs);
+                        if (!n || !isCell(n)) continue;
+
+                        const a = n.attrs || {};
+                        if (a.rmMergedTo && !seen.has(a.rmMergedTo)) {
+                            seen.add(a.rmMergedTo);
+                            targets.push({ abs, originId: a.rmMergedTo });
+                        } else if (a.rmMergeOrigin && (Number(a.rmRowspan || 1) > 1 || Number(a.rmColspan || 1) > 1)) {
+                            const id = String(a.rmCellId || '');
+                            if (id && !seen.has(id)) {
+                                seen.add(id);
+                                targets.push({ abs, originId: id });
+                            }
+                        }
+                    }
+
+                    // For each intersecting merge, move to that cell with a CellSelection and unmerge
+                    if (targets.length) {
+                        for (const t of targets) {
+                            const $cell = editor.state.doc.resolve(t.abs);
+                            const tr1 = editor.state.tr.setSelection(new CellSelection($cell, $cell));
+                            view.dispatch(tr1);
+                            editor.commands.unmergeTableAtSelection();
+                        }
+                    }
+
+
+                    editor.chain().focus().deleteRow().run();
+                    return true;
+                };
         return {
             mergeTableSelection: mergeInternal,
             unmergeTableAtSelection: unmergeInternal,
@@ -400,6 +469,8 @@ export const TableMergePlus = Extension.create({
                         // if unmerge succeeds -> done, else try merge
                         return unmergeInternal()(props) || mergeInternal()(props);
                     },
+            deleteRowPlus,
+
         };
     },
 });
