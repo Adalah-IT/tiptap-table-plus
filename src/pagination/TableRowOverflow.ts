@@ -5,7 +5,7 @@ import type { Node as PMNode } from 'prosemirror-model';
 export const TableRowOverflowKey = new PluginKey("TableRowOverflow");
 const RM_CLEANUP_META = "rmRowOverflowCleanup";
 
-const LIMIT = 880;
+const LIMIT = 900;
 const PULL_GAP = 24;
 const PULL_MARGIN = 12;
 

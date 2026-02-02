@@ -53,7 +53,6 @@ export const TableHeaderPlus = TableHeader.extend({
 
             // ✅ ADD CONTENT WRAPPER (same as TableCellPlus)
             const content = document.createElement("div");
-            content.className = "rm-cell-content";
             content.style.paddingInline = '16px';
             dom.appendChild(content);
 
@@ -75,6 +74,7 @@ export const TableHeaderPlus = TableHeader.extend({
                 dom.style.zIndex = "";
                 dom.style.overflow = "";
                 dom.style.maxHeight = "";
+                content.className = "";
 
                 content.style.position = "";
                 content.style.inset = "";
@@ -129,6 +129,7 @@ export const TableHeaderPlus = TableHeader.extend({
                     content.style.height = "var(--rm-merge-h, 100%)";
                     content.style.minHeight = "var(--rm-merge-h, 100%)";
                     content.style.zIndex = "3";
+                    content.className = "rm-cell-content";
                     content.style.pointerEvents = "auto";
                     content.style.backgroundColor = bg || "var(--color-secondary, #f5f5f5)";
                 }

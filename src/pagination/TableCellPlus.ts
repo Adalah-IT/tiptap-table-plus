@@ -22,9 +22,7 @@ export const TableCellPlus = TableCell.extend({
             const dom = document.createElement("td");
             dom.style.border = `1px solid var(--table-border-color, black)`;
 
-            // ✅ editable area
             const content = document.createElement("div");
-            content.className = "rm-cell-content";
             content.style.paddingInline = '16px'
             dom.appendChild(content);
 
@@ -46,6 +44,7 @@ export const TableCellPlus = TableCell.extend({
                 content.style.height = "";
                 content.style.minHeight = "";
                 content.style.zIndex = "";
+                content.className = "";
                 content.style.pointerEvents = "";
 
                 // colspan (visual)
@@ -88,6 +87,7 @@ export const TableCellPlus = TableCell.extend({
                     dom.style.backgroundColor = "transparent";
                     content.style.position = "absolute";
                     content.style.inset = "0";
+                    content.className = "rm-cell-content";
                     content.style.width = "var(--rm-merge-w, 100%)";
                     content.style.height = "var(--rm-merge-h, 100%)";
                     content.style.minHeight = "var(--rm-merge-h, 100%)";
