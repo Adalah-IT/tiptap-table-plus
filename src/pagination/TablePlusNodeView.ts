@@ -265,10 +265,9 @@ export class TablePlusNodeView {
             });
 
         } finally {
-            // FIX: Longer timeout to let pagination settle
             setTimeout(() => {
                 this.isAdjustingHeights = false;
-            }, 250);
+            }, 20);
         }
     }
     private scheduleRowspanRender() {
