@@ -108,6 +108,7 @@ export class TablePlusNodeView {
                 this.updateHandles();
                 // Ensure handle positions reflect current percentages
                 this.updateHandlePositions();
+                this.scheduleRowspanRender();
             }
         };
 
@@ -220,7 +221,7 @@ export class TablePlusNodeView {
                 origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
 
                 const buffer = 45;
-                const minHeightPerCell = 48;
+                const minHeightPerCell = 53.93;
                 let requiredHeightPerCell = Math.max(
                     minHeightPerCell,
                     Math.ceil((contentHeight + buffer) / rowspan)
