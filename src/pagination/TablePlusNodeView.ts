@@ -322,6 +322,7 @@ export class TablePlusNodeView {
                 maxB = Math.max(maxB, r.bottom);
             }
 
+            const printHeight = (maxB - minT) + rowspan;
             // ✅ surface (fills merged area)
             const surface = document.createElement("div");
             surface.className = "rm-merge-surface";
@@ -332,7 +333,7 @@ export class TablePlusNodeView {
             surface.style.height = `${maxB - minT}px`;
             surface.style.boxSizing = "border-box";
             surface.style.pointerEvents = "none"; // keep editing on real cells
-
+            surface.style.setProperty('--print-height', `${printHeight }px`);
             // match origin background if any
             const bg = getComputedStyle(origin).backgroundColor;
             if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent") {
