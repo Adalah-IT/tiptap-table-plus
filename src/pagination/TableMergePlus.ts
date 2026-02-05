@@ -10,6 +10,7 @@ declare module "@tiptap/core" {
             mergeTableSelection: () => ReturnType;
             unmergeTableAtSelection: () => ReturnType;
             deleteRowPlus: () => ReturnType;
+            insertRowAfterPlus: () => ReturnType;
         };
     }
 }
