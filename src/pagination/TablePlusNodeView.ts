@@ -188,7 +188,8 @@ export class TablePlusNodeView {
                 if (visibleMembers.length === 0) continue;
 
                 // Get merge width from visible members
-                let minL = Infinity, maxR = -Infinity;
+                let minL = Infinity,
+                    maxR = -Infinity;
                 for (const el of visibleMembers) {
                     const r = el.getBoundingClientRect();
                     minL = Math.min(minL, r.left);
@@ -222,38 +223,67 @@ export class TablePlusNodeView {
 
                 const buffer = 45;
                 const minHeightPerCell = 53.93;
-                let requiredHeightPerCell = Math.max(
-                    minHeightPerCell,
-                    Math.ceil((contentHeight + buffer) / rowspan)
-                );
+                const contentBasedHeight = Math.max(minHeightPerCell, Math.ceil((contentHeight + buffer) / rowspan));
 
-                requiredHeightPerCell = Math.min(requiredHeightPerCell, 440);
+                const rowMap = new Map<HTMLElement, HTMLElement[]>();
+                for (const member of visibleMembers) {
+                    const row = member.closest('tr') as HTMLElement;
+                    if (!row) continue;
+                    if (!rowMap.has(row)) rowMap.set(row, []);
+                    rowMap.get(row)!.push(member);
+                }
+
+                // Calculate per-row height based on tallest sibling in that row
+                let totalMergeHeight = 0;
+                const rowHeightMap = new Map<HTMLElement, number>();
+
+                for (const [row, membersInRow] of rowMap) {
+                    let rowHeight = contentBasedHeight;
+
+                    const siblings = row.querySelectorAll<HTMLElement>(
+                        'td:not([data-rm-merged-to]):not([data-rm-merge-origin="true"]), ' +
+                            'th:not([data-rm-merged-to]):not([data-rm-merge-origin="true"])',
+                    );
+
+                    for (const sibling of siblings) {
+                        const sibRect = sibling.getBoundingClientRect();
+                        if (sibRect.height > 0) {
+                            rowHeight = Math.max(rowHeight, sibRect.height);
+                        }
+                    }
+
+                    rowHeightMap.set(row, rowHeight);
+                    totalMergeHeight += rowHeight;
+                }
 
                 const lastHeight = origin.dataset.rmLastHeight;
-                const newHeight = requiredHeightPerCell.toString();
+                const newHeight = Math.round(totalMergeHeight).toString();
 
-                if (lastHeight && Math.abs(parseInt(lastHeight) - requiredHeightPerCell) < 5) {
+                if (lastHeight && Math.abs(parseInt(lastHeight) - totalMergeHeight) < 5) {
                     continue;
                 }
                 origin.dataset.rmLastHeight = newHeight;
 
-                origin.style.setProperty('--rm-merge-h', `${requiredHeightPerCell * rowspan}px`);
+                origin.style.setProperty('--rm-merge-h', `${totalMergeHeight}px`);
 
-                for (const member of visibleMembers) {
-                    const cellId = member.getAttribute('data-rm-cell-id');
-                    const mergedTo = member.getAttribute('data-rm-merged-to');
-                    const selector = cellId
-                        ? `[data-rm-cell-id="${cellId}"]`
-                        : mergedTo
-                            ? `[data-rm-merged-to="${mergedTo}"]`
-                            : null;
+                for (const [row, membersInRow] of rowMap) {
+                    const thisRowHeight = rowHeightMap.get(row) || contentBasedHeight;
 
-                    if (selector) {
-                        cssRules += `${selector} { height: ${requiredHeightPerCell}px !important; }\n`;
+                    for (const member of membersInRow) {
+                        const cellId = member.getAttribute('data-rm-cell-id');
+                        const mergedTo = member.getAttribute('data-rm-merged-to');
+                        const selector = cellId
+                            ? `[data-rm-cell-id="${cellId}"]`
+                            : mergedTo
+                              ? `[data-rm-merged-to="${mergedTo}"]`
+                              : null;
+
+                        if (selector) {
+                            cssRules += `${selector} { height: ${thisRowHeight}px !important; }\n`;
+                        }
                     }
                 }
             }
-
             const needsHeightAdjustment = cssRules.trim().length > 0;
             const hadRules = (styleEl.textContent || '').trim().length > 0;
 
@@ -271,6 +301,8 @@ export class TablePlusNodeView {
             }, 20);
         }
     }
+
+
     private scheduleRowspanRender() {
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
         this.rafRowspan = requestAnimationFrame(() => {
