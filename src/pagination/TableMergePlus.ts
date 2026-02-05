@@ -460,6 +460,274 @@ export const TableMergePlus = Extension.create({
                     editor.chain().focus().deleteRow().run();
                     return true;
                 };
+        const insertRowAfterPlus =
+            () =>
+                ({ state }: CommandProps) => {
+                    const editor = this.editor;
+                    const view = editor.view;
+
+                    const selLike: any = getCellSelectionLike(state);
+                    const $from = state.selection.$from;
+
+                    // Find the table from either the cell selection or the text cursor
+                    const tableInfo = selLike
+                        ? findAncestor(selLike.$anchorCell, isTable)
+                        : findAncestor($from, isTable);
+                    if (!tableInfo) return false;
+
+                    const tableNode = tableInfo.node;
+                    const tableStart = tableInfo.pos + 1;
+                    const map = TableMap.get(tableNode);
+
+                    // Find current cell position
+                    let anchorCellAbs: number | null = null;
+                    if (selLike) {
+                        anchorCellAbs = selLike.$anchorCell.pos;
+                    } else {
+                        for (let d = $from.depth; d >= 0; d--) {
+                            const n = $from.node(d);
+                            if (isCell(n)) {
+                                anchorCellAbs = $from.before(d);
+                                break;
+                            }
+                        }
+                    }
+                    if (anchorCellAbs == null) return false;
+
+                    const posInTable = anchorCellAbs - tableStart;
+                    const idx = map.map.indexOf(posInTable);
+                    if (idx < 0) return false;
+                    const currentRowIndex = Math.floor(idx / map.width);
+
+                    // Collect merge info BEFORE inserting the row
+                    // We need to know which merges span past the current row
+                    type MergeInfo = {
+                        originId: string;
+                        originPosInTable: number;
+                        colspan: number;
+                        rowspan: number;
+                        originRow: number;
+                        originCol: number;
+                    };
+
+                    const mergesToExtend: MergeInfo[] = [];
+                    const seenOrigins = new Set<string>();
+
+                    // Scan the current row to find merges that need extending
+                    for (let c = 0; c < map.width; c++) {
+                        const cellPosInTable = map.map[currentRowIndex * map.width + c];
+                        const abs = tableStart + cellPosInTable;
+                        const node = state.doc.nodeAt(abs);
+                        if (!node || !isCell(node)) continue;
+
+                        const attrs = node.attrs || {};
+
+                        // Case 1: This cell is an origin with rowspan > 1
+                        // The merge extends below current row, so new row should be included
+                        if (attrs.rmMergeOrigin && Number(attrs.rmRowspan || 1) > 1) {
+                            const originId = String(attrs.rmCellId || "");
+                            if (originId && !seenOrigins.has(originId)) {
+                                seenOrigins.add(originId);
+                                const rc = getCellRowCol(map, cellPosInTable);
+                                if (rc) {
+                                    mergesToExtend.push({
+                                        originId,
+                                        originPosInTable: cellPosInTable,
+                                        colspan: Number(attrs.rmColspan || 1),
+                                        rowspan: Number(attrs.rmRowspan || 1),
+                                        originRow: rc.row,
+                                        originCol: rc.col,
+                                    });
+                                }
+                            }
+                        }
+                            // Case 2: This cell is covered by a merge (rmMergedTo is set)
+                        // Need to check if the merge extends past this row
+                        else if (attrs.rmMergedTo) {
+                            const originId = String(attrs.rmMergedTo);
+                            if (!seenOrigins.has(originId)) {
+                                // Find the origin cell to get its rowspan
+                                let originInfo: MergeInfo | null = null;
+                                tableNode.descendants((n: PMNode, relPos: number) => {
+                                    if (originInfo) return false;
+                                    if (!isCell(n)) return true;
+                                    const a = n.attrs || {};
+                                    if (a.rmCellId === originId && a.rmMergeOrigin) {
+                                        const rc = getCellRowCol(map, relPos);
+                                        if (rc) {
+                                            const rowspan = Number(a.rmRowspan || 1);
+                                            const originBottom = rc.row + rowspan;
+                                            // Only extend if merge goes past current row
+                                            if (originBottom > currentRowIndex + 1) {
+                                                originInfo = {
+                                                    originId,
+                                                    originPosInTable: relPos,
+                                                    colspan: Number(a.rmColspan || 1),
+                                                    rowspan,
+                                                    originRow: rc.row,
+                                                    originCol: rc.col,
+                                                };
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                    return true;
+                                });
+                                if (originInfo) {
+                                    seenOrigins.add(originId);
+                                    mergesToExtend.push(originInfo);
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check rows ABOVE current row for merges that span into/past current row
+                    for (let r = 0; r < currentRowIndex; r++) {
+                        for (let c = 0; c < map.width; c++) {
+                            const cellPosInTable = map.map[r * map.width + c];
+                            const abs = tableStart + cellPosInTable;
+                            const node = state.doc.nodeAt(abs);
+                            if (!node || !isCell(node)) continue;
+
+                            const attrs = node.attrs || {};
+
+                            if (attrs.rmMergeOrigin) {
+                                const originId = String(attrs.rmCellId || "");
+                                if (originId && !seenOrigins.has(originId)) {
+                                    const rowspan = Number(attrs.rmRowspan || 1);
+                                    const rc = getCellRowCol(map, cellPosInTable);
+                                    if (rc) {
+                                        const originBottom = rc.row + rowspan;
+                                        // Merge spans past current row?
+                                        if (originBottom > currentRowIndex + 1) {
+                                            seenOrigins.add(originId);
+                                            mergesToExtend.push({
+                                                originId,
+                                                originPosInTable: cellPosInTable,
+                                                colspan: Number(attrs.rmColspan || 1),
+                                                rowspan,
+                                                originRow: rc.row,
+                                                originCol: rc.col,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Now do the standard row insert
+                    editor.chain().focus().addRowAfter().run();
+
+                    // If no merges to extend, we're done
+                    if (mergesToExtend.length === 0) return true;
+
+                    // Get fresh state after insert
+                    const newState = editor.state;
+                    const new$from = newState.selection.$from;
+                    const newTableInfo = findAncestor(new$from, isTable);
+                    if (!newTableInfo) return true;
+
+                    const newTableNode = newTableInfo.node;
+                    const newTableStart = newTableInfo.pos + 1;
+                    const newMap = TableMap.get(newTableNode);
+
+                    const newRowIndex = currentRowIndex + 1;
+                    const schema = newState.schema;
+                    const empty = emptyCellContent(schema);
+
+                    // Collect all updates
+                    type Update = { abs: number; oldNode: PMNode; newNode: PMNode };
+                    const updates: Update[] = [];
+                    const updatedOrigins = new Set<string>();
+
+                    for (const merge of mergesToExtend) {
+                        // Update origin's rowspan (only once per origin)
+                        if (!updatedOrigins.has(merge.originId)) {
+                            // Find origin in new doc
+                            let originAbs: number | null = null;
+                            let originNode: PMNode | null = null;
+
+                            newTableNode.descendants((n: PMNode, relPos: number) => {
+                                if (originAbs !== null) return false;
+                                if (!isCell(n)) return true;
+                                if (n.attrs?.rmCellId === merge.originId && n.attrs?.rmMergeOrigin) {
+                                    originAbs = newTableStart + relPos;
+                                    originNode = n;
+                                    return false;
+                                }
+                                return true;
+                            });
+
+                            if (originAbs !== null && originNode !== null) {
+                                const newOrigin = (originNode as PMNode).type.create(
+                                    {
+                                        ...(originNode as PMNode).attrs,
+                                        rmRowspan: merge.rowspan + 1,
+                                    },
+                                    (originNode as PMNode).content
+                                );
+                                updates.push({
+                                    abs: originAbs,
+                                    oldNode: originNode as PMNode,
+                                    newNode: newOrigin,
+                                });
+                                updatedOrigins.add(merge.originId);
+                            }
+                        }
+
+                        // Mark cells in the new row that fall within this merge's column span
+                        for (let c = merge.originCol; c < merge.originCol + merge.colspan; c++) {
+                            if (c >= newMap.width) continue;
+
+                            const newCellPosInTable = newMap.map[newRowIndex * newMap.width + c];
+                            const newCellAbs = newTableStart + newCellPosInTable;
+                            const newCellNode = newState.doc.nodeAt(newCellAbs);
+
+                            if (!newCellNode || !isCell(newCellNode)) continue;
+
+                            // Skip if already processed (handles colspan overlap)
+                            if (updates.some((u) => u.abs === newCellAbs)) continue;
+
+                            // Determine hideMode: "none" if in first row of merge (origin row), "hidden" otherwise
+                            const hideMode: HideMode = newRowIndex === merge.originRow ? "none" : "hidden";
+
+                            const coveredCell = newCellNode.type.create(
+                                {
+                                    ...newCellNode.attrs,
+                                    rmMergeOrigin: false,
+                                    rmMergedTo: merge.originId,
+                                    rmHideMode: hideMode,
+                                    rmColspan: 1,
+                                    rmRowspan: 1,
+                                },
+                                empty
+                            );
+
+                            updates.push({
+                                abs: newCellAbs,
+                                oldNode: newCellNode,
+                                newNode: coveredCell,
+                            });
+                        }
+                    }
+
+                    if (updates.length === 0) return true;
+
+                    // Sort descending by position to avoid shifts
+                    updates.sort((a, b) => b.abs - a.abs);
+
+                    let tr = newState.tr;
+                    for (const u of updates) {
+                        tr = tr.replaceWith(u.abs, u.abs + u.oldNode.nodeSize, u.newNode);
+                    }
+
+                    if (tr.docChanged) {
+                        view.dispatch(tr);
+                    }
+
+                    return true;
+                };
         return {
             mergeTableSelection: mergeInternal,
             unmergeTableAtSelection: unmergeInternal,
@@ -470,6 +738,7 @@ export const TableMergePlus = Extension.create({
                         return unmergeInternal()(props) || mergeInternal()(props);
                     },
             deleteRowPlus,
+            insertRowAfterPlus
 
         };
     },
