@@ -617,7 +617,8 @@ export class TablePlusNodeView {
 
         this.maxCellCount = _maxCellCount;
 
-        const getColumnSizeList = (columnSize: string) => {
+        const getColumnSizeList = (columnSize: string | null | undefined) => {
+            if (!columnSize) return [];
             const arr = columnSize.split(",").map((str) => str.trim());
             const numbers =
                 arr.length > 0 && arr.every((item) => item !== "" && !isNaN(Number(item)))

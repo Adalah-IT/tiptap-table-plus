@@ -75,7 +75,8 @@ export function isNodeAtRange(
   return found;
 }
 
-export function getColumnSizeList(columnSize: string) {
+export function getColumnSizeList(columnSize: string | null | undefined) {
+  if (!columnSize) return [];
   const arr: string[] = columnSize.split(",").map((str) => str.trim());
 
   const numbers: number[] = arr.every(

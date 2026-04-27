@@ -46,9 +46,9 @@ export const TablePlus = Table.extend<TablePlusOptions>({
           }
           return columnSizeList.join(",");
         },
-          renderHTML: (attributes: { columnSize: string }) => {
+          renderHTML: (attributes: { columnSize: string | null }) => {
           return {
-            "data-column-size": attributes.columnSize,
+            "data-column-size": attributes.columnSize ?? "",
           };
         },
       },
