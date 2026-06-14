@@ -10,6 +10,7 @@ declare module "@tiptap/core" {
         unsetTableAlign: () => ReturnType;
         toggleTableLock: () => ReturnType;
         setHeaderBackground: (color: string | null) => ReturnType;
+        setCellBackground: (color: string | null) => ReturnType;
         setTableBorderColor: (color: string | null) => ReturnType;
       };
     }
