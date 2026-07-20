@@ -6,6 +6,20 @@ export const TableCellPlus = TableCell.extend({
     addAttributes() {
         return {
             ...this.parent?.(),
+            backgroundColor: {
+                default: null,
+                parseHTML: (element: HTMLElement) =>
+                    element.getAttribute("data-cell-bg") ||
+                    element.style.backgroundColor ||
+                    null,
+                renderHTML: (attrs: { backgroundColor?: string | null }) => {
+                    if (!attrs.backgroundColor) return {};
+                    return {
+                        "data-cell-bg": attrs.backgroundColor,
+                        style: `background-color:${attrs.backgroundColor}`,
+                    };
+                },
+            },
             rmCellId: { default: null },
 
             rmMergeOrigin: { default: false },
@@ -45,7 +59,13 @@ export const TableCellPlus = TableCell.extend({
                 dom.style.overflow = "";
                 dom.style.maxHeight = "";
                 dom.style.borderColor = "var(--table-border-color, black)";
-                dom.style.backgroundColor = "";
+
+                // Per-cell background (e.g. shading imported from Word, or set
+                // via the setCellBackground command). Null leaves the cell unfilled.
+                const bg = n.attrs.backgroundColor as string | null;
+                dom.style.backgroundColor = bg || "";
+                if (bg) dom.setAttribute("data-cell-bg", bg);
+                else dom.removeAttribute("data-cell-bg");
 
                 content.style.position = "";
                 content.style.inset = "";
@@ -105,6 +125,7 @@ export const TableCellPlus = TableCell.extend({
                     content.style.minHeight = "var(--rm-merge-h, 100%)";
                     content.style.zIndex = "3";
                     content.style.pointerEvents = "auto";
+                    content.style.backgroundColor = bg || "";
                 }
             };
 
