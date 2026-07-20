@@ -7,6 +7,7 @@ import unsetTableAlign from "./commands/unsetTableAlign";
 import toggleTableLock from "./commands/toggleTableLock";
 import setHeaderBackground from "./commands/setHeaderBackground";
 import setTableBorderColor from "./commands/setTableBorderColor";
+import setCellVerticalAlign from "./commands/setCellVerticalAlign";
 
 type CommandContext = { state: EditorState; dispatch?: (tr: Transaction) => void };
 
@@ -51,6 +52,11 @@ export const TableCommandExtension = Extension.create({
                 (color: string | null) =>
                     ({ state, dispatch }: CommandContext) => {
                         return setTableBorderColor(color)({ state, dispatch });
+                    },
+            setCellVerticalAlign:
+                (value: "top" | "middle" | "bottom" | null) =>
+                    ({ state, dispatch }: CommandContext) => {
+                        return setCellVerticalAlign(value)({ state, dispatch });
                     },
         };
     },
