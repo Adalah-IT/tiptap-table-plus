@@ -222,7 +222,8 @@ export class TablePlusNodeView {
                 origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
 
                 const buffer = 45;
-                const minHeightPerCell = 53.93;
+                const cssFloor = parseFloat(getComputedStyle(this.dom).getPropertyValue('--rm-min-cell-height'));
+                const minHeightPerCell = Number.isFinite(cssFloor) ? cssFloor : 53.93;
                 const contentBasedHeight = Math.max(minHeightPerCell, Math.ceil((contentHeight + buffer) / rowspan));
 
                 const rowMap = new Map<HTMLElement, HTMLElement[]>();
