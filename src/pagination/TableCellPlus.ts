@@ -14,6 +14,15 @@ export const TableCellPlus = TableCell.extend({
 
             rmColspan: { default: 1 },
             rmRowspan: { default: 1 },
+
+            verticalAlign: {
+                default: null,
+                parseHTML: (element: HTMLElement) => element.getAttribute("data-vertical-align"),
+                renderHTML: (attrs: { verticalAlign?: string | null }) => {
+                    if (!attrs.verticalAlign) return {};
+                    return { "data-vertical-align": attrs.verticalAlign };
+                },
+            },
         };
     },
 
@@ -53,6 +62,9 @@ export const TableCellPlus = TableCell.extend({
                 dom.setAttribute("colspan", String(vCol));
 
                 // data attrs
+                if (n.attrs.verticalAlign) dom.setAttribute("data-vertical-align", String(n.attrs.verticalAlign));
+                else dom.removeAttribute("data-vertical-align");
+
                 if (n.attrs.rmCellId) dom.setAttribute("data-rm-cell-id", String(n.attrs.rmCellId));
                 else dom.removeAttribute("data-rm-cell-id");
 

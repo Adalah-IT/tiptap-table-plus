@@ -11,6 +11,7 @@ declare module "@tiptap/core" {
         toggleTableLock: () => ReturnType;
         setHeaderBackground: (color: string | null) => ReturnType;
         setTableBorderColor: (color: string | null) => ReturnType;
+        setCellVerticalAlign: (value: "top" | "middle" | "bottom" | null) => ReturnType;
       };
     }
   }
