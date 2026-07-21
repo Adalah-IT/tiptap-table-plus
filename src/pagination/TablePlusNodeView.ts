@@ -163,7 +163,8 @@ export class TablePlusNodeView {
                 ),
             );
 
-            let cssRules = '';
+            // Pass 1: measure every merge in isolation.
+            const merges: { origin: HTMLElement; contentBasedHeight: number; rowMap: Map<HTMLElement, HTMLElement[]> }[] = [];
 
             for (const origin of origins) {
                 const rowspan = Number(origin.getAttribute('data-rm-rowspan') || '1');
@@ -237,43 +238,47 @@ export class TablePlusNodeView {
                     rowMap.get(row)!.push(member);
                 }
 
-                // Calculate per-row height based on tallest sibling in that row
-                let totalMergeHeight = 0;
-                const rowHeightMap = new Map<HTMLElement, number>();
+                merges.push({ origin, contentBasedHeight, rowMap });
+            }
 
-                for (const [row, membersInRow] of rowMap) {
-                    let rowHeight = contentBasedHeight;
+            // Pass 2: one shared height per row — the max need across ALL merges
+            // covering it plus the tallest non-merged sibling. Per-origin math lets
+            // two merges spanning the same rows disagree and end at different bottoms.
+            const globalRowHeights = new Map<HTMLElement, number>();
+            for (const merge of merges) {
+                for (const row of merge.rowMap.keys()) {
+                    globalRowHeights.set(row, Math.max(globalRowHeights.get(row) ?? 0, merge.contentBasedHeight));
+                }
+            }
+            for (const row of globalRowHeights.keys()) {
+                const siblings = row.querySelectorAll<HTMLElement>(
+                    'td:not([data-rm-merged-to]):not([data-rm-merge-origin="true"]), ' +
+                        'th:not([data-rm-merged-to]):not([data-rm-merge-origin="true"])',
+                );
 
-                    const siblings = row.querySelectorAll<HTMLElement>(
-                        'td:not([data-rm-merged-to]):not([data-rm-merge-origin="true"]), ' +
-                            'th:not([data-rm-merged-to]):not([data-rm-merge-origin="true"])',
-                    );
-
-                    for (const sibling of siblings) {
-                        // offsetHeight is layout px, immune to zoom transforms — a scaled
-                        // measurement written back as CSS height compounds every round.
-                        const sibHeight = sibling.offsetHeight;
-                        if (sibHeight > 0) {
-                            rowHeight = Math.max(rowHeight, sibHeight);
-                        }
+                for (const sibling of siblings) {
+                    // offsetHeight is layout px, immune to zoom transforms — a scaled
+                    // measurement written back as CSS height compounds every round.
+                    const sibHeight = sibling.offsetHeight;
+                    if (sibHeight > 0) {
+                        globalRowHeights.set(row, Math.max(globalRowHeights.get(row)!, sibHeight));
                     }
+                }
+            }
 
-                    rowHeightMap.set(row, rowHeight);
-                    totalMergeHeight += rowHeight;
+            // Pass 3: write member heights from the shared row heights.
+            let cssRules = '';
+            for (const merge of merges) {
+                let totalMergeHeight = 0;
+                for (const row of merge.rowMap.keys()) {
+                    totalMergeHeight += globalRowHeights.get(row)!;
                 }
 
-                const lastHeight = origin.dataset.rmLastHeight;
-                const newHeight = Math.round(totalMergeHeight).toString();
+                merge.origin.dataset.rmLastHeight = Math.round(totalMergeHeight).toString();
+                merge.origin.style.setProperty('--rm-merge-h', `${totalMergeHeight}px`);
 
-                if (lastHeight && Math.abs(parseInt(lastHeight) - totalMergeHeight) < 5) {
-                    continue;
-                }
-                origin.dataset.rmLastHeight = newHeight;
-
-                origin.style.setProperty('--rm-merge-h', `${totalMergeHeight}px`);
-
-                for (const [row, membersInRow] of rowMap) {
-                    const thisRowHeight = rowHeightMap.get(row) || contentBasedHeight;
+                for (const [row, membersInRow] of merge.rowMap) {
+                    const thisRowHeight = globalRowHeights.get(row)!;
 
                     for (const member of membersInRow) {
                         const cellId = member.getAttribute('data-rm-cell-id');
@@ -290,10 +295,11 @@ export class TablePlusNodeView {
                     }
                 }
             }
-            const needsHeightAdjustment = cssRules.trim().length > 0;
-            const hadRules = (styleEl.textContent || '').trim().length > 0;
 
-            if (needsHeightAdjustment || hadRules) {
+            // Only rewrite when rules changed (also clears them when the last merge
+            // goes away). Replaces the <5px guard, whose `continue` dropped a stable
+            // origin's rules from the rebuilt stylesheet.
+            if (cssRules !== (styleEl.textContent || '')) {
                 styleEl.textContent = cssRules;
             }
 
