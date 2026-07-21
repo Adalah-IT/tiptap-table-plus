@@ -195,7 +195,10 @@ export class TablePlusNodeView {
                     minL = Math.min(minL, r.left);
                     maxR = Math.max(maxR, r.right);
                 }
-                const mergeWidth = maxR - minL;
+                // getBoundingClientRect is scaled by any ancestor transform (editor zoom);
+                // normalize back to layout px so scaled values are never written as CSS.
+                const zoomScale = this.dom.offsetWidth > 0 ? this.dom.getBoundingClientRect().width / this.dom.offsetWidth : 1;
+                const mergeWidth = (maxR - minL) / zoomScale;
 
                 // Measure content height in isolation
                 const originalPosition = content.style.position;
@@ -247,9 +250,11 @@ export class TablePlusNodeView {
                     );
 
                     for (const sibling of siblings) {
-                        const sibRect = sibling.getBoundingClientRect();
-                        if (sibRect.height > 0) {
-                            rowHeight = Math.max(rowHeight, sibRect.height);
+                        // offsetHeight is layout px, immune to zoom transforms — a scaled
+                        // measurement written back as CSS height compounds every round.
+                        const sibHeight = sibling.offsetHeight;
+                        if (sibHeight > 0) {
+                            rowHeight = Math.max(rowHeight, sibHeight);
                         }
                     }
 
@@ -320,6 +325,9 @@ export class TablePlusNodeView {
         this.rowspanLayer.innerHTML = "";
 
         const wrapperRect = this.dom.getBoundingClientRect();
+        // Rect deltas are in scaled (visual) px under editor zoom; the surface is
+        // positioned in layout px inside this.dom, so divide the scale back out.
+        const zoomScale = this.dom.offsetWidth > 0 ? wrapperRect.width / this.dom.offsetWidth : 1;
 
         const origins = Array.from(
             this.dom.querySelectorAll<HTMLElement>(
@@ -355,15 +363,15 @@ export class TablePlusNodeView {
                 maxB = Math.max(maxB, r.bottom);
             }
 
-            const printHeight = (maxB - minT) + rowspan;
+            const printHeight = (maxB - minT) / zoomScale + rowspan;
             // ✅ surface (fills merged area)
             const surface = document.createElement("div");
             surface.className = "rm-merge-surface";
             surface.style.position = "absolute";
-            surface.style.left = `${minL - wrapperRect.left}px`;
-            surface.style.top = `${minT - wrapperRect.top}px`;
-            surface.style.width = `${maxR - minL}px`;
-            surface.style.height = `${maxB - minT}px`;
+            surface.style.left = `${(minL - wrapperRect.left) / zoomScale}px`;
+            surface.style.top = `${(minT - wrapperRect.top) / zoomScale}px`;
+            surface.style.width = `${(maxR - minL) / zoomScale}px`;
+            surface.style.height = `${(maxB - minT) / zoomScale}px`;
             surface.style.boxSizing = "border-box";
             surface.style.pointerEvents = "none"; // keep editing on real cells
             surface.style.setProperty('--print-height', `${printHeight }px`);
