@@ -91,6 +91,7 @@ export const TableHeaderPlus = TableHeader.extend({
                 content.style.height = "";
                 content.style.minHeight = "";
                 content.style.zIndex = "";
+                content.style.boxSizing = "";
                 content.style.pointerEvents = "";
 
                 // ✅ COLSPAN (visual)
@@ -144,6 +145,9 @@ export const TableHeaderPlus = TableHeader.extend({
                     content.className = "rm-cell-content";
                     content.style.pointerEvents = "auto";
                     content.style.backgroundColor = bg || "var(--color-secondary, #f5f5f5)";
+                    // Match the surface geometry; padding-inline would widen a
+                    // content-box beyond --rm-merge-w.
+                    content.style.boxSizing = "border-box";
                 }
             };
 
@@ -152,6 +156,17 @@ export const TableHeaderPlus = TableHeader.extend({
             return {
                 dom,
                 contentDOM: content,
+                // Style/attr writes come from the merge layout machinery, not editing;
+                // letting ProseMirror read them resets CellSelection to TextSelection.
+                ignoreMutation(mutation: MutationRecord | { type: string; target: Node }) {
+                    if (mutation.type === 'selection') {
+                        return false;
+                    }
+                    if (mutation.type === 'attributes') {
+                        return true;
+                    }
+                    return !content.contains(mutation.target);
+                },
                 update(updatedNode) {
                     if (updatedNode.type.name !== 'tableHeader') {
                         return false;

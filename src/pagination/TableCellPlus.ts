@@ -73,6 +73,7 @@ export const TableCellPlus = TableCell.extend({
                 content.style.height = "";
                 content.style.minHeight = "";
                 content.style.zIndex = "";
+                content.style.boxSizing = "";
                 content.className = "";
                 content.style.pointerEvents = "";
 
@@ -125,7 +126,10 @@ export const TableCellPlus = TableCell.extend({
                     content.style.minHeight = "var(--rm-merge-h, 100%)";
                     content.style.zIndex = "3";
                     content.style.pointerEvents = "auto";
-                    content.style.backgroundColor = bg || "";
+                    // Surface overlay owns the fill; painting here too double-paints
+                    // at the wrong size whenever --rm-merge-w/h are stale.
+                    content.style.backgroundColor = "";
+                    content.style.boxSizing = "border-box";
                 }
             };
 
@@ -134,6 +138,13 @@ export const TableCellPlus = TableCell.extend({
             return {
                 dom,
                 contentDOM: content,
+                // Style/attr writes come from the merge layout machinery, not editing;
+                // letting ProseMirror read them resets CellSelection to TextSelection.
+                ignoreMutation(mutation: MutationRecord | { type: string; target: Node }) {
+                    if (mutation.type === "selection") return false;
+                    if (mutation.type === "attributes") return true;
+                    return !content.contains(mutation.target);
+                },
                 update(updatedNode) {
                     if (updatedNode.type.name !== "tableCell") return false;
                     apply(updatedNode);

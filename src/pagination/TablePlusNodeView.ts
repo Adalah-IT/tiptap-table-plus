@@ -146,7 +146,11 @@ export class TablePlusNodeView {
     }
 
     private adjustRowHeightsForMergedCells() {
-        if (this.isAdjustingHeights) return;
+        if (this.isAdjustingHeights) {
+            // Never drop a scheduled pass — retry once the in-flight one releases.
+            setTimeout(() => this.scheduleRowspanRender(), 25);
+            return;
+        }
         this.isAdjustingHeights = true;
 
         try {
@@ -389,13 +393,10 @@ export class TablePlusNodeView {
             surface.style.boxSizing = "border-box";
             surface.style.pointerEvents = "none"; // keep editing on real cells
             surface.style.setProperty('--print-height', `${printHeight }px`);
-            // match origin background if any
-            const bg = getComputedStyle(origin).backgroundColor;
-            if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent") {
-                surface.style.backgroundColor = bg;
-            } else {
-                surface.style.backgroundColor = "transparent";
-            }
+            // data-cell-bg mirrors the node attr; computed style is forced
+            // transparent by the cell view, so read the attribute instead.
+            surface.style.backgroundColor =
+                origin.getAttribute("data-cell-bg") || origin.getAttribute("data-header-bg") || "transparent";
 
             const borderColor = getComputedStyle(this.dom).getPropertyValue('--table-border-color').trim() || 'black';
             surface.style.border = `1px solid ${borderColor}`;
