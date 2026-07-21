@@ -27,6 +27,7 @@ export class TablePlusNodeView {
     private rafRowspan?: number;
     private layoutObserver?: ResizeObserver;
     private isAdjustingHeights = false;
+    private onSelectionUpdate?: () => void;
     constructor(
         node: Node,
         getPos: () => number | undefined,
@@ -82,6 +83,10 @@ export class TablePlusNodeView {
         this.startDirectionObserver();
         this.scheduleInitialRowspanRender();
         this.setupLayoutObserver();
+        // Re-render overlays on selection change so the merged-cell selection tint
+        // (drawn on the measured surface layer) appears/clears with the selection.
+        this.onSelectionUpdate = () => this.scheduleRowspanRender();
+        this.editor.on('selectionUpdate', this.onSelectionUpdate);
 
     }
 
@@ -142,6 +147,7 @@ export class TablePlusNodeView {
         this.dirObserver?.disconnect();
         this.dirObserver = undefined;
         this.layoutObserver?.disconnect();
+        if (this.onSelectionUpdate) this.editor.off('selectionUpdate', this.onSelectionUpdate);
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
     }
 
@@ -402,6 +408,21 @@ export class TablePlusNodeView {
             surface.style.border = `1px solid ${borderColor}`;
 
             this.rowspanLayer.appendChild(surface);
+
+            // Selection tint: a measured overlay matching the surface exactly, so it
+            // never overshoots the merged area like a content-height-based tint does.
+            if (origin.classList.contains('selectedCell')) {
+                const sel = document.createElement("div");
+                sel.className = "rm-merge-selection";
+                sel.style.position = "absolute";
+                sel.style.left = `${(minL - wrapperRect.left) / zoomScale}px`;
+                sel.style.top = `${(minT - wrapperRect.top) / zoomScale}px`;
+                sel.style.width = `${(maxR - minL) / zoomScale}px`;
+                sel.style.height = `${(maxB - minT) / zoomScale}px`;
+                sel.style.boxSizing = "border-box";
+                sel.style.pointerEvents = "none";
+                this.rowspanLayer.appendChild(sel);
+            }
         }
     }
 
