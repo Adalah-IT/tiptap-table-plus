@@ -164,7 +164,12 @@ export class TablePlusNodeView {
             );
 
             // Pass 1: measure every merge in isolation.
-            const merges: { origin: HTMLElement; contentBasedHeight: number; rowMap: Map<HTMLElement, HTMLElement[]> }[] = [];
+            const merges: {
+                origin: HTMLElement;
+                contentBasedHeight: number;
+                rowMap: Map<HTMLElement, HTMLElement[]>;
+                mergeWidth: number;
+            }[] = [];
 
             for (const origin of origins) {
                 const rowspan = Number(origin.getAttribute('data-rm-rowspan') || '1');
@@ -223,8 +228,6 @@ export class TablePlusNodeView {
                 content.style.height = originalHeight;
                 content.style.minHeight = originalMinHeight;
 
-                origin.style.setProperty('--rm-merge-w', `${mergeWidth}px`);
-
                 const buffer = 45;
                 const cssFloor = parseFloat(getComputedStyle(this.dom).getPropertyValue('--rm-min-cell-height'));
                 const minHeightPerCell = Number.isFinite(cssFloor) ? cssFloor : 53.93;
@@ -238,7 +241,7 @@ export class TablePlusNodeView {
                     rowMap.get(row)!.push(member);
                 }
 
-                merges.push({ origin, contentBasedHeight, rowMap });
+                merges.push({ origin, contentBasedHeight, rowMap, mergeWidth });
             }
 
             // Pass 2: one shared height per row — the max need across ALL merges
@@ -274,8 +277,13 @@ export class TablePlusNodeView {
                     totalMergeHeight += globalRowHeights.get(row)!;
                 }
 
-                merge.origin.dataset.rmLastHeight = Math.round(totalMergeHeight).toString();
-                merge.origin.style.setProperty('--rm-merge-h', `${totalMergeHeight}px`);
+                // Emit merge geometry as attribute-keyed rules, not inline style —
+                // ProseMirror can recreate the td node view, which wipes inline vars
+                // and leaves the editable content one row tall (dead click zones).
+                const originId = merge.origin.getAttribute('data-rm-cell-id');
+                if (originId) {
+                    cssRules += `[data-rm-cell-id="${originId}"] { --rm-merge-w: ${Math.round(merge.mergeWidth)}px; --rm-merge-h: ${Math.round(totalMergeHeight)}px; }\n`;
+                }
 
                 for (const [row, membersInRow] of merge.rowMap) {
                     const thisRowHeight = globalRowHeights.get(row)!;
