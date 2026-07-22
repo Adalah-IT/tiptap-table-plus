@@ -10,6 +10,7 @@ import { ReplaceStep } from "prosemirror-transform";
 import { findParentNodeOfType, findParentNodeOfTypeAtPos, calculateNewColumnWidth, addColumns, isNodeAtRange, getColumnSizeList } from "../utilities/utils";
 import { Node } from "@tiptap/pm/model";
 import { TableRowOverflow } from './TableRowOverflow';
+import { TableCellPasteMap } from './TableCellPasteMap';
 
 export const TablePlus = Table.extend<TablePlusOptions>({
   content: "(tableRow)+",
@@ -97,6 +98,7 @@ export const TablePlus = Table.extend<TablePlusOptions>({
   addProseMirrorPlugins() {
       const parentPlugins = this.parent?.() ?? []
       return [
+          TableCellPasteMap,
           ...parentPlugins,
       new Plugin({
         key: new PluginKey("tablePlusPlugin"),
