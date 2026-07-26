@@ -25,6 +25,7 @@ export class TablePlusNodeView {
 
     rowspanLayer: HTMLElement;
     private rafRowspan?: number;
+    private rowspanRetryTimer?: ReturnType<typeof setTimeout>;
     private layoutObserver?: ResizeObserver;
     private isAdjustingHeights = false;
     private onSelectionUpdate?: () => void;
@@ -149,6 +150,7 @@ export class TablePlusNodeView {
         this.layoutObserver?.disconnect();
         if (this.onSelectionUpdate) this.editor.off('selectionUpdate', this.onSelectionUpdate);
         if (this.rafRowspan) cancelAnimationFrame(this.rafRowspan);
+        if (this.rowspanRetryTimer) clearTimeout(this.rowspanRetryTimer);
     }
 
     private adjustRowHeightsForMergedCells() {
@@ -338,7 +340,10 @@ export class TablePlusNodeView {
         this.rafRowspan = requestAnimationFrame(() => {
             const rect = this.dom.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) {
-                setTimeout(() => this.scheduleRowspanRender(), 50);
+                // A detached table measures 0x0 forever, so retrying would loop
+                // every 50ms for the life of the tab, each closure pinning the editor.
+                if (!this.dom.isConnected) { return; }
+                this.rowspanRetryTimer = setTimeout(() => this.scheduleRowspanRender(), 50);
                 return;
             }
             this.adjustRowHeightsForMergedCells();
