@@ -4,10 +4,20 @@ import type { Node as PMNode } from 'prosemirror-model';
 
 export const TableRowOverflowKey = new PluginKey("TableRowOverflow");
 const RM_CLEANUP_META = "rmRowOverflowCleanup";
+const RM_NORMALIZE_META = "rmRowOverflowNormalize";
 
 const LIMIT = 900;
 const PULL_GAP = 24;
 const PULL_MARGIN = 12;
+const LIMIT_PAGE_BUFFER = 31;
+const BULK_INSERT_THRESHOLD = 500;
+const NORMALIZE_DEBOUNCE_MS = 250;
+const NORMALIZE_MAX_PASSES = 50;
+
+const getLimit = (view: EditorView) => {
+    const raw = parseFloat(getComputedStyle(view.dom).getPropertyValue("--rm-page-content-height"));
+    return Number.isFinite(raw) && raw > 200 ? raw - LIMIT_PAGE_BUFFER : LIMIT;
+};
 
 const uuid = () => {
     const c: any = globalThis.crypto;
@@ -243,7 +253,7 @@ const cellInsertPosAtEnd = (cellPos: number, cellNode: any) => {
     return insertPos;
 };
 
-const pullUpOneBlockFromLinkedRow = (view: EditorView) => {
+const pullUpOneBlockFromLinkedRow = (view: EditorView, limit: number) => {
     const { state } = view;
 
     const row = findRow(state);
@@ -264,7 +274,7 @@ const pullUpOneBlockFromLinkedRow = (view: EditorView) => {
     const currContent =
         (currCellEl.querySelector(".rm-cell-content") as HTMLElement | null) ?? currCellEl;
 
-    const available = LIMIT - getHeight(cell.node, currContent);
+    const available = limit - getHeight(cell.node, currContent);
     if (available < PULL_GAP) return false;
 
     const nextCell = getCellAtRowPos(state.doc, nextRow?.pos, colIndex);
@@ -490,8 +500,169 @@ const deleteLinkedRowsForMainIds = (
     return tr.steps.length ? tr : null;
 };
 
+const blockOuterHeight = (el: HTMLElement | null) => {
+    if (!el) return 0;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.height + (parseFloat(cs.marginTop || "0") || 0) + (parseFloat(cs.marginBottom || "0") || 0);
+};
+
+const computeMoveStart = (view: EditorView, cellPos: number, cellNode: PMNode, limit: number): number | null => {
+    let cum = 0;
+    let blockPos = cellPos + 1;
+    for (let i = 0; i < cellNode.childCount; i++) {
+        const dom = view.nodeDOM(blockPos);
+        cum += blockOuterHeight(dom instanceof HTMLElement ? dom : null);
+        if (i >= 1 && cum > limit - PULL_MARGIN) return i;
+        blockPos += cellNode.child(i).nodeSize;
+    }
+    return null;
+};
+
+type RowSplitPlan = {
+    rowPos: number;
+    cells: Array<{ colIndex: number; moveStart: number }>;
+};
+
+const findOverflowingRowPlan = (view: EditorView, limit: number): RowSplitPlan | null => {
+    let plan: RowSplitPlan | null = null;
+
+    view.state.doc.descendants((node, pos) => {
+        if (plan) return false;
+        if (!isRowNode(node)) return true;
+
+        let skip = false;
+        node.forEach((cell: any) => {
+            if (!isNormalCell(cell) || Number(cell.attrs?.rmRowspan || 1) > 1) skip = true;
+        });
+        if (skip) return false;
+
+        const cells: RowSplitPlan["cells"] = [];
+        let cellPos = pos + 1;
+        for (let i = 0; i < node.childCount; i++) {
+            const cell = node.child(i);
+            if (cell.childCount >= 2) {
+                const dom = view.nodeDOM(cellPos);
+                const el = dom instanceof HTMLElement ? dom : null;
+                const content = (el?.querySelector(".rm-cell-content") as HTMLElement | null) ?? el;
+                if (content && getHeight(cell, content) >= limit) {
+                    const moveStart = computeMoveStart(view, cellPos, cell, limit);
+                    if (moveStart !== null) cells.push({ colIndex: i, moveStart });
+                }
+            }
+            cellPos += cell.nodeSize;
+        }
+
+        if (cells.length) plan = { rowPos: pos, cells };
+        return false;
+    });
+
+    return plan;
+};
+
+const cellPosInRow = (doc: PMNode, rowPos: number, colIndex: number) => {
+    const rowNode = doc.nodeAt(rowPos);
+    if (!rowNode || colIndex >= rowNode.childCount) return null;
+    let pos = rowPos + 1;
+    for (let i = 0; i < colIndex; i++) pos += rowNode.child(i).nodeSize;
+    return pos;
+};
+
+const buildSplitTr = (view: EditorView, plan: RowSplitPlan) => {
+    const { state } = view;
+    const rowNode = state.doc.nodeAt(plan.rowPos);
+    if (!isRowNode(rowNode)) return null;
+
+    let tr = state.tr;
+
+    const rowId = rowNode!.attrs?.rmRowId as string | null;
+    const linkedTo = rowNode!.attrs?.rmLinkedTo as string | null;
+    const mainRowId = linkedTo || rowId || uuid();
+
+    if (!linkedTo && !rowId) {
+        tr = tr.setNodeMarkup(plan.rowPos, undefined, { ...rowNode!.attrs, rmRowId: mainRowId });
+    }
+
+    const afterPos = plan.rowPos + rowNode!.nodeSize;
+    const nextRow = state.doc.nodeAt(afterPos);
+
+    if (!(isRowNode(nextRow) && nextRow?.attrs?.rmLinkedTo === mainRowId)) {
+        const cells = [];
+        for (let i = 0; i < rowNode!.childCount; i++) {
+            cells.push(createEmptyCell(rowNode!.child(i), state.schema));
+        }
+        const newRow = rowNode!.type.create({ ...rowNode!.attrs, rmRowId: null, rmLinkedTo: mainRowId }, cells);
+        tr = tr.insert(afterPos, newRow);
+    }
+
+    const selFrom = state.selection.from;
+    let selTrack: { pos: number; mapFrom: number } | null = null;
+
+    const columns = [...plan.cells].sort((a, b) => b.colIndex - a.colIndex);
+    for (const col of columns) {
+        const srcCellPos = cellPosInRow(tr.doc, plan.rowPos, col.colIndex);
+        if (srcCellPos === null) continue;
+        const srcCell = tr.doc.nodeAt(srcCellPos);
+        if (!srcCell || col.moveStart >= srcCell.childCount) continue;
+
+        let from = srcCellPos + 1;
+        for (let i = 0; i < col.moveStart; i++) from += srcCell.child(i).nodeSize;
+        const to = srcCellPos + srcCell.nodeSize - 1;
+
+        const frag = srcCell.content.cut(from - srcCellPos - 1, to - srcCellPos - 1);
+        const selOffset = selFrom >= from && selFrom < to ? selFrom - from : null;
+
+        tr = tr.delete(from, to);
+
+        const rowNow = tr.doc.nodeAt(plan.rowPos);
+        if (!rowNow) return null;
+        const contRowPos = plan.rowPos + rowNow.nodeSize;
+        const contCellPos = cellPosInRow(tr.doc, contRowPos, col.colIndex);
+        if (contCellPos === null) continue;
+        const contCell = tr.doc.nodeAt(contCellPos);
+        if (!contCell) continue;
+
+        let insertAt = contCellPos + 1;
+        if (contCell.childCount === 1 && isCellEffectivelyEmpty(contCell)) {
+            tr = tr.replaceWith(insertAt, insertAt + contCell.child(0).nodeSize, frag);
+        } else {
+            tr = tr.insert(insertAt, frag);
+        }
+
+        if (selOffset !== null) {
+            selTrack = { pos: insertAt + selOffset, mapFrom: tr.mapping.maps.length };
+        }
+    }
+
+    if (!tr.steps.length) return null;
+
+    if (selTrack) {
+        const mapped = tr.mapping.slice(selTrack.mapFrom).map(selTrack.pos);
+        try {
+            tr = tr.setSelection(TextSelection.near(tr.doc.resolve(mapped)));
+        } catch { /* keep default mapped selection */ }
+    }
+
+    return tr;
+};
+
 export const TableRowOverflow = new Plugin({
     key: TableRowOverflowKey,
+    state: {
+        init: () => ({ req: 0, passes: 0 }),
+        apply(tr, v: { req: number; passes: number }) {
+            if (tr.getMeta(RM_NORMALIZE_META)) return { req: v.req + 1, passes: v.passes + 1 };
+            if (!tr.docChanged) return v;
+
+            let inserted = 0;
+            for (const step of tr.steps) {
+                step.getMap().forEach((_os, _oe, ns, ne) => { inserted += ne - ns; });
+            }
+            if (inserted >= BULK_INSERT_THRESHOLD) return { req: v.req + 1, passes: 0 };
+
+            return v.passes ? { req: v.req, passes: 0 } : v;
+        },
+    },
     appendTransaction(transactions, oldState, newState) {
         if (transactions.some(t => t.getMeta(RM_CLEANUP_META))) return null;
         if (!transactions.some(t => t.docChanged)) return null;
@@ -512,7 +683,7 @@ export const TableRowOverflow = new Plugin({
 
             const text = event.clipboardData?.getData("text/plain") ?? "";
             const addedHeight = measureTextHeight(content, text) ?? 0;
-            const shouldRedirect = getHeight(cell.node, content) + addedHeight >= LIMIT
+            const shouldRedirect = getHeight(cell.node, content) + addedHeight >= getLimit(view)
             if (!shouldRedirect) return false;
             event.preventDefault();
 
@@ -525,16 +696,61 @@ export const TableRowOverflow = new Plugin({
         },
     },
 
-    view() {
+    view(editorView) {
         let lastRowKey = "";
         let wasOver = false;
 
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let rafId = 0;
+        let lastReq = 0;
+        let destroyed = false;
+
+        const runNormalizePass = (view: EditorView) => {
+            if (destroyed || view.isDestroyed || !view.editable) return;
+            if (view.composing) {
+                scheduleNormalize(view, NORMALIZE_DEBOUNCE_MS);
+                return;
+            }
+
+            const st = TableRowOverflowKey.getState(view.state) as { passes: number } | undefined;
+            if (st && st.passes > NORMALIZE_MAX_PASSES) return;
+
+            const limit = getLimit(view);
+            const plan = findOverflowingRowPlan(view, limit);
+            if (!plan) return;
+
+            const tr = buildSplitTr(view, plan);
+            if (!tr) return;
+
+            tr.setMeta(RM_NORMALIZE_META, true);
+            view.dispatch(tr);
+        };
+
+        const scheduleNormalize = (view: EditorView, delay: number) => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(() => {
+                timer = null;
+                cancelAnimationFrame(rafId);
+                rafId = requestAnimationFrame(() => runNormalizePass(view));
+            }, delay);
+        };
+
+        scheduleNormalize(editorView, NORMALIZE_DEBOUNCE_MS);
+
         return {
             update(view: EditorView, prevState: EditorState) {
+                const st = TableRowOverflowKey.getState(view.state) as { req: number; passes: number } | undefined;
+                if (st && st.req !== lastReq) {
+                    lastReq = st.req;
+                    scheduleNormalize(view, st.passes ? 50 : NORMALIZE_DEBOUNCE_MS);
+                }
+
                 if (view.state.doc.eq(prevState.doc)) return;
                 if (!inCell(view.state)) return;
 
                 requestAnimationFrame(() => {
+                    if (destroyed || view.isDestroyed) return;
+
                     const row = findRow(view.state);
                     const cell = findCell(view.state);
                     if (!row || !cell) return;
@@ -550,8 +766,9 @@ export const TableRowOverflow = new Plugin({
                     const content = (cellEl.querySelector(".rm-cell-content") as HTMLElement | null) ?? cellEl;
                     const height = getHeight(cell.node, content);
 
-                    const over = height >= LIMIT;
-                    const under = height <= (LIMIT - PULL_GAP);
+                    const limit = getLimit(view);
+                    const over = height >= limit;
+                    const under = height <= (limit - PULL_GAP);
                     if (over && !wasOver) {
                         const ok = insertOrGotoLinkedRow(view);
                         if (ok) wasOver = true;
@@ -560,12 +777,16 @@ export const TableRowOverflow = new Plugin({
                     if (!over) wasOver = false;
 
                     if (under) {
-                        pullUpOneBlockFromLinkedRow(view);
+                        pullUpOneBlockFromLinkedRow(view, limit);
                     }
 
                 });
             },
-            destroy() {},
+            destroy() {
+                destroyed = true;
+                if (timer) clearTimeout(timer);
+                cancelAnimationFrame(rafId);
+            },
         };
     },
 });
