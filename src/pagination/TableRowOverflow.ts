@@ -288,9 +288,9 @@ const pullUpOneBlockFromLinkedRow = (view: EditorView, limit: number) => {
         (nextCellDom?.querySelector?.(".rm-cell-content") as HTMLElement | null) ?? nextCellDom;
 
     const blockEl = (nextContent?.children[movable.index] as HTMLElement | undefined) ?? null;
-    const blockH = blockEl?.getBoundingClientRect().height ?? 0;
+    const blockH = blockEl ? blockOuterHeight(blockEl) : 0;
 
-    if (blockH && blockH > available - PULL_MARGIN) return false;
+    if (blockH && blockH > available - PULL_GAP) return false;
 
     let blockPos = nextCell.pos + 1;
     for (let i = 0; i < movable.index; i++) blockPos += nextCell.node.child(i).nodeSize;
