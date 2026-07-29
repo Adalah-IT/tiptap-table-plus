@@ -72,6 +72,14 @@ export const TablePlus = Table.extend<TablePlusOptions>({
           return attributes.locked ? { "data-locked": "true" } : {};
         },
       },
+      // Column order (Word's bidiVisual); applied to the DOM by the node view.
+      dir: {
+        default: null,
+        parseHTML: (element: HTMLElement) => element.getAttribute("dir"),
+        renderHTML: (attributes: { dir: string | null }) => {
+          return attributes.dir === "ltr" || attributes.dir === "rtl" ? { dir: attributes.dir } : {};
+        },
+      },
     };
   },
     renderHTML({ node, HTMLAttributes }: { node: any; HTMLAttributes: Record<string, any> }) {
