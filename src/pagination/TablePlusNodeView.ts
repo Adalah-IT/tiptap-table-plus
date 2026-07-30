@@ -620,6 +620,11 @@ export class TablePlusNodeView {
     }
 
     getIsRTL(): boolean {
+        // The table's own direction wins over the editor/document direction.
+        const nodeDir = this.node?.attrs?.dir;
+        if (nodeDir === "rtl") return true;
+        if (nodeDir === "ltr") return false;
+
         const editorElement = this.editor.view.dom as HTMLElement;
         const computedStyle = window.getComputedStyle(editorElement);
         const direction = computedStyle.direction;
@@ -647,6 +652,13 @@ export class TablePlusNodeView {
 
 
     updateNode(node: Node) {
+        this.node = node;
+        const dir = node.attrs.dir;
+        if (dir === "ltr" || dir === "rtl") {
+            this.dom.setAttribute("dir", dir);
+        } else {
+            this.dom.removeAttribute("dir");
+        }
         this.isRTL = this.getIsRTL();
         this.isLocked = Boolean(node.attrs.locked);
         this.applyTableStyles(node);
